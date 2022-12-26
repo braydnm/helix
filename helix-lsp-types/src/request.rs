@@ -165,6 +165,9 @@ macro_rules! lsp_request {
     ("textDocument/diagnostic") => {
         $crate::request::DocumentDiagnosticRequest
     };
+    ("textDocument/switchSourceHeader") => {
+        $crate::request::SwitchSourceHeader
+    };
     ("workspace/diagnostic") => {
         $crate::request::WorkspaceDiagnosticRequest
     };
@@ -966,6 +969,17 @@ impl Request for TypeHierarchySubtypes {
     type Params = TypeHierarchySubtypesParams;
     type Result = Option<Vec<TypeHierarchyItem>>;
     const METHOD: &'static str = "typeHierarchy/subtypes";
+}
+
+/// `textDocument/switchSourceHeader` is an extension implemented by clangd
+/// that determines the source file from a header or vice versa.
+///
+/// @since clangd 6.0
+pub enum SwitchSourceHeader {}
+impl Request for SwitchSourceHeader {
+    type Params = TextDocumentIdentifier;
+    type Result = Option<Url>;
+    const METHOD: &'static str = "textDocument/switchSourceHeader";
 }
 
 #[cfg(test)]

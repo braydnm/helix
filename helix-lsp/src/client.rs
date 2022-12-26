@@ -1552,4 +1552,12 @@ impl Client {
             changes,
         })
     }
+
+    pub fn switch_source_header(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+    ) -> Option<impl Future<Output = Result<Option<Url>>>> {
+        Some(self.call::<lsp::request::SwitchSourceHeader>(text_document))
+    }
 }
+
