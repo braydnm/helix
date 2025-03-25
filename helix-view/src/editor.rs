@@ -2121,8 +2121,29 @@ impl Editor {
     pub fn focus_direction(&mut self, direction: tree::Direction) {
         let current_view = self.tree.focus;
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
-            self.focus(id)
+            self.focus(id);
+            return;
         }
+
+        match &self.config().terminal {
+            Some(TerminalConfig { command, args: _ }) => {
+                if command != "tmux" {
+                    return;
+                }
+            }
+            _ => return,
+        };
+
+        std::process::Command::new("tmux")
+            .arg("select-pane")
+            .arg(match direction {
+                tree::Direction::Up => "-U".to_string(),
+                tree::Direction::Down => "-D".to_string(),
+                tree::Direction::Left => "-L".to_string(),
+                tree::Direction::Right => "-R".to_string(),
+            })
+            .spawn()
+            .expect("Failed to switch panes");
     }
 
     pub fn swap_split_in_direction(&mut self, direction: tree::Direction) {
