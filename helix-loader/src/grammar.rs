@@ -490,6 +490,9 @@ fn build_tree_sitter_library(
         #[cfg(not(windows))]
         command.arg("-fPIC");
 
+        #[cfg(feature = "native")]
+        command.arg("-march=native");
+
         command
             .arg("-shared")
             .arg("-fno-exceptions")
