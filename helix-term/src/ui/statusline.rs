@@ -493,14 +493,13 @@ fn render_file_modification_indicator<F>(context: &mut RenderContext, write: F)
 where
     F: Fn(&mut RenderContext, String, Option<Style>) + Copy,
 {
-    let title = (if context.doc.is_modified() {
-        "[+]"
-    } else {
-        "   "
-    })
-    .to_string();
+    let mut title = context.doc.get_modified_indicator();
 
-    write(context, title, None);
+    if title.is_empty() {
+        title = "    "
+    }
+
+    write(context, title.to_string(), None);
 }
 
 fn render_read_only_indicator<F>(context: &mut RenderContext, write: F)
