@@ -4,6 +4,13 @@ use helix_lsp::LanguageServerId;
 
 use crate::{ClientId, editor::Config, Document, DocumentId, Editor, ViewId};
 
+use std::path::PathBuf;
+
+pub enum FileModifiedType {
+    NeedRescan,
+    Paths(Vec<PathBuf>),
+}
+
 events! {
     DocumentDidOpen<'a> {
         editor: &'a mut Editor,
@@ -16,9 +23,16 @@ events! {
         changes: &'a ChangeSet,
         ghost_transaction: bool
     }
+    DocumentPathDidChange<'a> {
+        doc: &'a mut Document,
+        original_path: Option<PathBuf>
+    }
     DocumentDidClose<'a> {
         editor: &'a mut Editor,
         doc: Document
+    }
+    FileModified {
+        event: FileModifiedType
     }
     SelectionDidChange<'a> { doc: &'a mut Document, view: ViewId }
     DiagnosticsDidChange<'a> { editor: &'a mut Editor, doc: DocumentId }

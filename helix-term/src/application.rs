@@ -43,7 +43,7 @@ use crate::{
 use core::pin::Pin;
 use log::{debug, error, info, warn};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Keys, HashMap},
     fs::File,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -90,6 +90,10 @@ impl ApplicationClients {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    pub fn client_ids(&self) -> Keys<'_, ClientId, ApplicationClient> {
+        self.map.keys()
     }
 }
 

@@ -44,6 +44,7 @@ use helix_core::{
     ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
 };
 
+use crate::events::DocumentPathDidChange;
 use crate::{
     editor::Config,
     events::{DocumentDidChange, SelectionDidChange},
@@ -139,6 +140,12 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
 }
 
+#[derive(Debug, Clone)]
+pub enum ExternalFileUpdate {
+    LastModified(SystemTime),
+    DoesNotExit,
+}
+
 pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
@@ -188,6 +195,10 @@ pub struct Document {
     // Last time we wrote to the file. This will carry the time the file was last opened if there
     // were no saves.
     last_saved_time: SystemTime,
+
+    // Last time the file was modified, this includes modifies done by external processes.
+    // If this document does not correspond to a file on disk, this value is None
+    last_modified_time: Option<SystemTime>,
 
     last_saved_revision: usize,
     version: i32, // should be usize?
@@ -309,6 +320,7 @@ impl fmt::Debug for Document {
             .field("old_state", &self.old_state)
             // .field("history", &self.history)
             .field("last_saved_time", &self.last_saved_time)
+            .field("last_modified_time", &self.last_modified_time)
             .field("last_saved_revision", &self.last_saved_revision)
             .field("version", &self.version)
             .field("modified_since_accessed", &self.modified_since_accessed)
@@ -707,6 +719,7 @@ impl Document {
             history: Cell::new(History::default()),
             savepoints: Vec::new(),
             last_saved_time: SystemTime::now(),
+            last_modified_time: None,
             last_saved_revision: 0,
             modified_since_accessed: false,
             language_servers: HashMap::new(),
@@ -1190,6 +1203,8 @@ impl Document {
             },
             None => SystemTime::now(),
         };
+
+        self.last_modified_time = Some(self.last_saved_time)
     }
 
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
@@ -1262,8 +1277,13 @@ impl Document {
     /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
         // if parent doesn't exist we still want to open the document
-        // and error out when document is saved
+        let original_path = self.path.take();
         self.path = path.map(|path| path.to_path_buf());
+
+        helix_event::dispatch(DocumentPathDidChange {
+            doc: self,
+            original_path,
+        });
 
         self.detect_readonly();
         self.pickup_last_saved_time();
@@ -1747,6 +1767,7 @@ impl Document {
         );
         self.last_saved_revision = rev;
         self.last_saved_time = save_time;
+        self.last_modified_time = Some(save_time)
     }
 
     /// Get the document's latest saved revision.
@@ -2261,6 +2282,50 @@ impl Document {
     /// (since it often means inlay hints have been fully deactivated).
     pub fn reset_all_inlay_hints(&mut self) {
         self.inlay_hints = Default::default();
+    }
+
+    pub fn handle_external_modify_event(&mut self, update: &ExternalFileUpdate) {
+        if let ExternalFileUpdate::DoesNotExit = update {
+            self.last_modified_time = None;
+            return;
+        }
+
+        self.last_modified_time = Some(match update {
+            ExternalFileUpdate::LastModified(time) => *time,
+            ExternalFileUpdate::DoesNotExit => unreachable!(),
+        });
+    }
+
+    pub fn requires_reload(&self) -> bool {
+        match (self.is_modified(), self.last_modified_time) {
+            (false, Some(modified_time)) => self.last_saved_time < modified_time,
+            _ => false,
+        }
+    }
+
+    pub fn get_modified_indicator(&self) -> &str {
+        match (
+            self.is_modified(),
+            self.last_saved_time,
+            self.last_modified_time,
+        ) {
+            (false, _, None) => "",
+            (true, _, None) => "[+]",
+            (false, saved_time, Some(modified_time)) => {
+                if saved_time < modified_time {
+                    "[~]"
+                } else {
+                    ""
+                }
+            }
+            (true, saved_time, Some(modified_time)) => {
+                if saved_time < modified_time {
+                    "[!]"
+                } else {
+                    "[+]"
+                }
+            }
+        }
     }
 }
 
