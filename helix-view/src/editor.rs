@@ -28,7 +28,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
-    io::{self, stdin},
+    io::{self},
     num::{NonZeroU8, NonZeroUsize},
     path::{Path, PathBuf},
     pin::Pin,
@@ -1966,7 +1966,7 @@ impl Editor {
     }
 
     pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
-        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut io::stdin(), None)?;
         let doc = Document::from(
             helix_core::Rope::default(),
             Some((encoding, has_bom)),

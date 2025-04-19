@@ -29,7 +29,7 @@ use helix_view::{
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, Editor, Theme, View,
+    Document, Editor, Theme, View, events::FocusChanged,
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
@@ -693,7 +693,7 @@ impl EditorView {
                 bufferline_inactive
             };
 
-            let text = format!(" {}{} ", fname, if doc.is_modified() { "[+]" } else { "" });
+            let text = format!(" {}{} ", fname, doc.get_modified_indicator());
             let used_width = viewport.x.saturating_sub(x);
             let rem_width = surface.area.width.saturating_sub(used_width);
 
@@ -1577,6 +1577,7 @@ impl Component for EditorView {
             Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
             Event::FocusGained => {
                 self.terminal_focused = true;
+                helix_event::dispatch(FocusChanged{});
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {
@@ -1591,6 +1592,7 @@ impl Component for EditorView {
                     }
                 }
                 self.terminal_focused = false;
+                helix_event::dispatch(FocusChanged{});
                 EventResult::Consumed(None)
             }
         }

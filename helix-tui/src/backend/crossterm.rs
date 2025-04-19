@@ -22,6 +22,7 @@ use std::{
 };
 use termini::TermInfo;
 
+
 fn term_program() -> Option<String> {
     // Some terminals don't set $TERM_PROGRAM
     match std::env::var("TERM_PROGRAM") {
@@ -224,6 +225,22 @@ where
             terminal::Clear(terminal::ClearType::All)
         )?;
         terminal::disable_raw_mode()
+    }
+
+    fn force_restore() -> io::Result<()> {
+        let mut stdout = io::stdout();
+
+        // reset cursor shape
+        write!(stdout, "\x1B[0 q")?;
+        // Ignore errors on disabling, this might trigger on windows if we call
+        // disable without calling enable previously
+        let _ = execute!(stdout, DisableMouseCapture);
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        let _ = execute!(stdout, DisableBracketedPaste);
+        execute!(stdout, DisableFocusChange)?;
+        execute!(stdout, LeaveAlternateScreenCustom)?;
+        terminal::disable_raw_mode()?;
+        stdout.flush()
     }
 
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
@@ -457,5 +474,23 @@ impl Command for SetUnderlineColor {
             std::io::ErrorKind::Other,
             "SetUnderlineColor not supported by winapi.",
         ))
+    }
+}
+
+/// Custom implementation of LeaveAlternateScreen that uses terminfo rmcup
+/// This avoids the blank lines issue by properly using the terminal's capability
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaveAlternateScreenCustom;
+
+impl Command for LeaveAlternateScreenCustom {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // Just use the standard escape sequence without the extra window manipulation
+        f.write_str("\x1B[?1049l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        // On Windows, just use the standard crossterm implementation
+        crossterm::terminal::LeaveAlternateScreen.execute_winapi()
     }
 }

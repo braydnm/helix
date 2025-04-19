@@ -31,7 +31,7 @@ assets = [
 ]
 
 [features]
-default = ["git"]
+default = ["git", "watchman_client"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
 git = ["helix-vcs/git"]
@@ -56,7 +56,7 @@ anyhow = "1"
 once_cell = "1.21"
 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "time", "process", "macros", "fs", "parking_lot"] }
-tui = { path = "../helix-tui", package = "helix-tui", default-features = false, features = ["termina", "crossterm"] }
+tui = { path = "../helix-tui", package = "helix-tui", default-features = false, features = ["termina"] }
 termina = { workspace = true, features = ["event-stream"] }
 signal-hook = "0.4"
 tokio-stream = "0.1"
@@ -94,12 +94,20 @@ serde = { version = "1.0", features = ["derive"] }
 
 dashmap = "6.0"
 
+# notify for autoreload
+notify-debouncer-full = "0.4.0"
+inotify = "0.11.0"
+
+watchman_client = { version = "0.9", optional = true }
+
 [target.'cfg(windows)'.dependencies]
-crossterm = { version = "0.28", features = ["event-stream"] }
 
 [target.'cfg(not(windows))'.dependencies]  # https://github.com/vorner/signal-hook/issues/100
 signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 libc = "0.2.183"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kqueue = "1.0.8"
 
 [build-dependencies]
 helix-loader = { path = "../helix-loader" }
