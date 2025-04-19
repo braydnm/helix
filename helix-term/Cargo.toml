@@ -31,10 +31,11 @@ assets = [
 ]
 
 [features]
-default = ["git"]
+default = ["git", "watchman_client"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
 git = ["helix-vcs/git"]
+no-auto-reload = []
 
 [[bin]]
 name = "hx"
@@ -91,12 +92,21 @@ serde = { version = "1.0", features = ["derive"] }
 grep-regex = "0.1.13"
 grep-searcher = "0.1.14"
 
+dashmap = "6.0"
+
+# notify for autoreload
+notify-debouncer-full = "0.4.0"
+inotify = "0.11.0"
+
+watchman_client = { version = "0.9", optional = true }
+
 [target.'cfg(not(windows))'.dependencies]  # https://github.com/vorner/signal-hook/issues/100
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 libc = "0.2.174"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-crossterm = { version = "0.28", features = ["event-stream", "use-dev-tty", "libc"] }
+crossterm = { version = "0.28", features = ["event-stream", "use-dev-tty"] }
+kqueue = "1.0.8"
 
 [build-dependencies]
 helix-loader = { path = "../helix-loader" }

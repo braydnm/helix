@@ -32,6 +32,11 @@ pub fn dispatch_blocking(job: impl FnOnce(&mut Editor, &mut Compositor) + Send +
     send_blocking(jobs, Callback::EditorCompositor(Box::new(job)))
 }
 
+pub fn dispatch_blocking_editor_only(job: impl FnOnce(&mut Editor) + Send + 'static) {
+    let jobs = JOB_QUEUE.wait();
+    send_blocking(jobs, Callback::Editor(Box::new(job)))
+}
+
 pub enum Callback {
     EditorCompositor(EditorCompositorCallback),
     Editor(EditorCallback),

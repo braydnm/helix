@@ -1136,6 +1136,8 @@ impl Application {
 
         self.restore_term()?;
 
+        // Log before processing close errors
+
         for err in close_errs {
             self.editor.exit_code = 1;
             eprintln!("Error: {}", err);
