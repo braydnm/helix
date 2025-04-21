@@ -2,15 +2,13 @@ use std::{collections::HashMap, path::PathBuf, sync, time::Duration};
 
 use helix_event::register_hook;
 use helix_view::{
-    events::{
-        DocumentDidClose, DocumentDidOpen, DocumentPathDidChange
-    },
-    handlers::{AutoReloadEvent, Handlers, FileEventKind, FileEvent},
+    events::{DocumentDidClose, DocumentDidOpen, DocumentPathDidChange, FocusChanged},
+    handlers::{AutoReloadEvent, FileEvent, FileEventKind, Handlers},
     DocumentId, Editor,
 };
 use tokio::time::Instant;
 
-use crate::{handlers::watcher::Watcher, job};
+use crate::{application::ApplicationClients, handlers::watcher::Watcher, job};
 use super::watcher::RecommendedWatcher;
 
 const AUTO_RELOAD_CREATE_SCAN: Duration = Duration::from_millis(100);
@@ -58,9 +56,17 @@ impl AutoReloadHandler {
                     self.watcher.unwatch(path).await;
                 }
 
-                debug_assert!(!self.path_doc_id.values().any(|d| *d == doc_id));
                 self.path_doc_id.insert(new_path.clone(), doc_id);
                 self.watcher.watch(new_path).await;
+            }
+            AutoReloadEvent::FocusChanged => {
+                let changed_files = self.watcher.poll_created_files().await.unwrap();
+                if !changed_files.is_empty() {
+                    self.watcher.commit().unwrap();
+                }
+                for file in changed_files {
+                    self.queue_modified_file(file);
+                }
             }
         }
 
@@ -69,8 +75,8 @@ impl AutoReloadHandler {
     }
 
     async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<AutoReloadEvent>) {
-        let creation_poll_sleep = tokio::time::sleep(AUTO_RELOAD_CREATE_SCAN);
-        tokio::pin!(creation_poll_sleep);
+        // let creation_poll_sleep = tokio::time::sleep(AUTO_RELOAD_CREATE_SCAN);
+        // tokio::pin!(creation_poll_sleep);
 
         let mut watcher_fd = self.watcher.wait_fd();
 
@@ -85,17 +91,17 @@ impl AutoReloadHandler {
 
                     self.watcher.commit().unwrap();
                 },
-                () = &mut creation_poll_sleep => {
-                    let changed_files = self.watcher.poll_created_files().await.unwrap();
-                    if !changed_files.is_empty() {
-                        self.watcher.commit().unwrap();
-                    }
-                    for file in changed_files {
-                        self.queue_modified_file(file);
-                    }
+                // () = &mut creation_poll_sleep => {
+                //     let changed_files = self.watcher.poll_created_files().await.unwrap();
+                //     if !changed_files.is_empty() {
+                //         self.watcher.commit().unwrap();
+                //     }
+                //     for file in changed_files {
+                //         self.queue_modified_file(file);
+                //     }
 
-                    creation_poll_sleep.as_mut().reset(Instant::now() + AUTO_RELOAD_CREATE_SCAN);
-                },
+                //     creation_poll_sleep.as_mut().reset(Instant::now() + AUTO_RELOAD_CREATE_SCAN);
+                // },
                 event = rx.recv() => {
                     if let Some(event) = event {
                         self.handle_auto_reload_event(event).await;
@@ -153,16 +159,14 @@ impl AutoReloadHandler {
                         }
 
                 if doc.has_conflicting_changes()
-                    && editor
-                        .tree
-                        .try_get(editor.tree.focus)
-                        .map_or(false, |view| view.doc == doc.id())
+                    && client_view!(editor, *client).doc == doc.id()
                 {
                     editor.set_warning("file externally modified; :write! or :reload");
                     continue;
                 } else if !doc.was_externally_modified() {
                     continue;
                 }
+                        let mut view_ids: Vec<_> = doc.selections().keys().cloned().collect();
 
                         if view_ids.is_empty() {
                             doc.ensure_view_init(view_id);
@@ -231,6 +235,12 @@ pub(super) fn register_hooks(handlers: &Handlers) {
                 event.doc.path().unwrap().clone(),
             ),
         );
+        Ok(())
+    });
+
+    let tx = handlers.auto_reload.clone();
+    register_hook!(move |event: &mut FocusChanged| {
+        helix_event::send_blocking(&tx, AutoReloadEvent::FocusChanged);
         Ok(())
     });
 }

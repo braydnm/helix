@@ -4,7 +4,7 @@ use helix_view::events::{
     ConfigDidChange, DiagnosticsDidChange, DocumentDidChange, DocumentDidClose, DocumentDidOpen,
     DocumentFocusLost, LanguageServerExited, LanguageServerInitialized, SelectionDidChange,
 
-    DocumentPathDidChange,
+    DocumentPathDidChange, FocusChanged
 };
 
 use crate::commands;
@@ -31,4 +31,5 @@ pub fn register() {
     register_event::<ConfigDidChange>();
 
     register_event::<DocumentPathDidChange>();
+    register_event::<FocusChanged>();
 }

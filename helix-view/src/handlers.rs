@@ -37,6 +37,7 @@ pub enum AutoReloadEvent {
     DocumentOpen(PathBuf, DocumentId),
     DocumentPathChange(DocumentId, Option<PathBuf>, PathBuf),
     DocumentClose(PathBuf),
+    FocusChanged,
 }
 
 pub struct Handlers {
