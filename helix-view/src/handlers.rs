@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use completion::{CompletionEvent, CompletionHandler};
 use helix_event::send_blocking;
@@ -17,13 +18,25 @@ pub enum AutoSaveEvent {
     DocumentChanged { save_after: u64 },
     LeftInsertMode,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileEventKind {
+    Modify(SystemTime),
+    Delete,
+}
+
+#[derive(Debug)]
+pub struct FileEvent {
+    pub path: PathBuf,
+    pub kind: FileEventKind,
+}
+
 // TODO: Handle document saving un-named file
+#[derive(Debug)]
 pub enum AutoReloadEvent {
     DocumentOpen(PathBuf, DocumentId),
     DocumentPathChange(DocumentId, Option<PathBuf>, PathBuf),
     DocumentClose(PathBuf),
-    DocumentsModified(Vec<PathBuf>),
-    ReloadAllDocuments,
 }
 
 pub struct Handlers {
@@ -31,7 +44,7 @@ pub struct Handlers {
     pub completions: CompletionHandler,
     pub signature_hints: Sender<lsp::SignatureHelpEvent>,
     pub auto_save: Sender<AutoSaveEvent>,
-    pub auto_reload: Sender<AutoReloadEvent>,
+    pub auto_reload: tokio::sync::mpsc::Sender<AutoReloadEvent>,
     pub document_colors: Sender<lsp::DocumentColorsEvent>,
 }
 

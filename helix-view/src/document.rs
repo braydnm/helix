@@ -45,6 +45,7 @@ use helix_core::{
 };
 
 use crate::events::DocumentPathDidChange;
+use crate::handlers::FileEventKind;
 use crate::{
     editor::Config,
     events::{DocumentDidChange, SelectionDidChange},
@@ -1367,6 +1368,7 @@ impl Document {
 
     /// Mark document as recent used for MRU sorting
     pub fn mark_as_focused(&mut self) {
+        log::info!("Focused on {:?}", self.id);
         self.focused_at = std::time::Instant::now();
     }
 
@@ -2284,23 +2286,29 @@ impl Document {
         self.inlay_hints = Default::default();
     }
 
-    pub fn handle_external_modify_event(&mut self, update: &ExternalFileUpdate) {
-        if let ExternalFileUpdate::DoesNotExit = update {
+    pub fn handle_external_modify_event(&mut self, update: &FileEventKind) {
+        if let FileEventKind::Delete = update {
             self.last_modified_time = None;
             return;
         }
 
         self.last_modified_time = Some(match update {
-            ExternalFileUpdate::LastModified(time) => *time,
-            ExternalFileUpdate::DoesNotExit => unreachable!(),
+            FileEventKind::Modify(time) => *time,
+            FileEventKind::Delete => unreachable!(),
         });
     }
 
+    pub fn was_externally_modified(&self) -> bool {
+        self.last_modified_time
+            .map_or(false, |modified_time| self.last_saved_time < modified_time)
+    }
+
+    pub fn has_conflicting_changes(&self) -> bool {
+        self.is_modified() && self.was_externally_modified()
+    }
+
     pub fn requires_reload(&self) -> bool {
-        match (self.is_modified(), self.last_modified_time) {
-            (false, Some(modified_time)) => self.last_saved_time < modified_time,
-            _ => false,
-        }
+        !self.is_modified() && self.was_externally_modified()
     }
 
     pub fn get_modified_indicator(&self) -> &str {

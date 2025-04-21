@@ -1,118 +1,128 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync, time::Duration};
 
 use helix_event::register_hook;
 use helix_view::{
-    document::ExternalFileUpdate,
     events::{
-        DocumentDidClose, DocumentDidOpen, DocumentPathDidChange, FileModified, FileModifiedType,
+        DocumentDidClose, DocumentDidOpen, DocumentPathDidChange
     },
-    handlers::{AutoReloadEvent, Handlers},
+    handlers::{AutoReloadEvent, Handlers, FileEventKind, FileEvent},
     DocumentId, Editor,
 };
+use tokio::time::Instant;
 
-use notify_debouncer_full::{
-    notify::{
-        event::CreateKind, event::ModifyKind, event::RemoveKind, EventKind, RecommendedWatcher,
-        RecursiveMode,
-    },
-    DebounceEventResult, Debouncer, RecommendedCache,
-};
+use crate::{handlers::watcher::Watcher, job};
+use super::watcher::RecommendedWatcher;
 
-use crate::{application::ApplicationClients, job};
-
-const AUTO_RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
+const AUTO_RELOAD_CREATE_SCAN: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub(super) struct AutoReloadHandler {
-    watcher: Debouncer<RecommendedWatcher, RecommendedCache>,
+    watcher: RecommendedWatcher,
     path_doc_id: HashMap<PathBuf, DocumentId>,
-    externally_modified_doc_ids: HashMap<DocumentId, ExternalFileUpdate>,
-}
-fn handle_event(event: DebounceEventResult) {
-    let mut events = match event {
-        Ok(e) => e,
-        Err(e) => {
-            log::error!(
-                "Received unexpected response from filesystem watcher: {:?}",
-                e
-            );
-            return;
-        }
-    };
-
-    let mut modified_paths: Vec<PathBuf> = Vec::new();
-
-    for event in &mut events {
-        match (event.need_rescan(), event.kind) {
-            (true, _) => {
-                log::warn!("Received a rescan event, this may lead to performance degredation if this occurs frequently");
-                helix_event::dispatch(FileModified {
-                    event: helix_view::events::FileModifiedType::NeedRescan,
-                });
-                return;
-            }
-            (
-                false,
-                invalid_event @ EventKind::Create(CreateKind::Folder)
-                | invalid_event @ EventKind::Remove(RemoveKind::Folder),
-            ) => {
-                log::error!(
-                    "Received an event that indicates a folder is being watched: {:?}",
-                    invalid_event
-                );
-            }
-            (false, EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))) => {}
-            (
-                false,
-                EventKind::Any
-                | EventKind::Modify(_)
-                | EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Other)
-                | EventKind::Create(_)
-                | EventKind::Other,
-            ) => {
-                modified_paths.append(&mut event.paths);
-            }
-        };
-    }
-
-    helix_event::dispatch(FileModified {
-        event: helix_view::events::FileModifiedType::Paths(modified_paths),
-    });
+    externally_modified_doc_ids: HashMap<DocumentId, FileEventKind>,
 }
 
 impl AutoReloadHandler {
     pub fn new() -> AutoReloadHandler {
         AutoReloadHandler {
-            watcher: notify_debouncer_full::new_debouncer(AUTO_RELOAD_DEBOUNCE, None, handle_event)
-                .unwrap(),
+            watcher: RecommendedWatcher::new().unwrap(),
             path_doc_id: HashMap::new(),
             externally_modified_doc_ids: HashMap::new(),
         }
     }
 
-    fn queue_modified_file(&mut self, path: &PathBuf) {
-        let doc_id = match self.path_doc_id.get(path) {
+    pub fn start(self) -> tokio::sync::mpsc::Sender<AutoReloadEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(self.run(rx));
+        }
+        tx
+    }
+
+    async fn handle_auto_reload_event(&mut self, event: AutoReloadEvent) {
+        match event {
+            // TODO: Handle these better than just unwrapping
+            AutoReloadEvent::DocumentOpen(path, document_id) => {
+                log::info!("Document opened!");
+                debug_assert!(!path.is_dir());
+                self.path_doc_id.insert(path.clone(), document_id);
+                self.watcher.watch(path).await;
+            }
+            AutoReloadEvent::DocumentClose(path) => {
+                self.path_doc_id.remove(&path);
+                self.watcher.unwatch(path).await;
+            }
+            AutoReloadEvent::DocumentPathChange(doc_id, original_path, new_path) => {
+                if let Some(path) = original_path {
+                    self.path_doc_id.remove(&path);
+                    self.watcher.unwatch(path).await;
+                }
+
+                debug_assert!(!self.path_doc_id.values().any(|d| *d == doc_id));
+                self.path_doc_id.insert(new_path.clone(), doc_id);
+                self.watcher.watch(new_path).await;
+            }
+        }
+
+        // TODO: Verify value
+        self.watcher.commit();
+    }
+
+    async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<AutoReloadEvent>) {
+        let creation_poll_sleep = tokio::time::sleep(AUTO_RELOAD_CREATE_SCAN);
+        tokio::pin!(creation_poll_sleep);
+
+        let mut watcher_fd = self.watcher.wait_fd();
+
+        loop {
+            tokio::select! {
+                biased;
+                guard = watcher_fd.readable_mut() => {
+                    guard.unwrap().clear_ready_matching(tokio::io::Ready::READABLE);
+                    while let Ok(Some(event)) = self.watcher.try_read_platform_event().await {
+                        self.queue_modified_file(event);
+                    }
+
+                    self.watcher.commit().unwrap();
+                },
+                () = &mut creation_poll_sleep => {
+                    let changed_files = self.watcher.poll_created_files().await.unwrap();
+                    if !changed_files.is_empty() {
+                        self.watcher.commit().unwrap();
+                    }
+                    for file in changed_files {
+                        self.queue_modified_file(file);
+                    }
+
+                    creation_poll_sleep.as_mut().reset(Instant::now() + AUTO_RELOAD_CREATE_SCAN);
+                },
+                event = rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_auto_reload_event(event).await;
+                    }
+                }
+            }
+
+            if !self.externally_modified_doc_ids.is_empty() {
+                self.handle_external_updates();
+            }
+        }
+    }
+
+    fn queue_modified_file(&mut self, event: FileEvent) {
+        let doc_id = match self.path_doc_id.get(&event.path) {
             Some(doc_id) => doc_id,
             None => {
                 log::warn!(
                     "Got notified about {:?} but do not have doc ID in map",
-                    path
+                    event.path
                 );
                 return;
             }
         };
 
-        if self.externally_modified_doc_ids.contains_key(doc_id) {
-            return;
-        }
-
-        let status = match std::fs::metadata(path) {
-            Ok(e) => ExternalFileUpdate::LastModified(e.modified().unwrap()),
-            Err(_) => ExternalFileUpdate::DoesNotExit,
-        };
-
         self.externally_modified_doc_ids
-            .insert(doc_id.clone(), status);
+            .insert(doc_id.clone(), event.kind);
     }
 
     fn handle_external_updates(&mut self) {
@@ -142,7 +152,17 @@ impl AutoReloadHandler {
                             continue;
                         }
 
-                        let mut view_ids: Vec<_> = doc.selections().keys().cloned().collect();
+                if doc.has_conflicting_changes()
+                    && editor
+                        .tree
+                        .try_get(editor.tree.focus)
+                        .map_or(false, |view| view.doc == doc.id())
+                {
+                    editor.set_warning("file externally modified; :write! or :reload");
+                    continue;
+                } else if !doc.was_externally_modified() {
+                    continue;
+                }
 
                         if view_ids.is_empty() {
                             doc.ensure_view_init(view_id);
@@ -177,68 +197,13 @@ impl AutoReloadHandler {
     }
 }
 
-impl helix_event::AsyncHook for AutoReloadHandler {
-    type Event = AutoReloadEvent;
-
-    fn handle_event(
-        &mut self,
-        event: Self::Event,
-        timeout: Option<tokio::time::Instant>,
-    ) -> Option<tokio::time::Instant> {
-        assert_eq!(timeout, None);
-
-        match event {
-            // TODO: Handle these better than just unwrapping
-            AutoReloadEvent::DocumentOpen(path, document_id) => {
-                debug_assert!(!path.clone().as_path().is_dir());
-                self.path_doc_id.insert(path.clone(), document_id);
-                self.watcher
-                    .watch(path, RecursiveMode::NonRecursive)
-                    .unwrap();
-            }
-            AutoReloadEvent::DocumentClose(path) => {
-                self.path_doc_id.remove(&path);
-                self.watcher.unwatch(path).unwrap();
-            }
-            AutoReloadEvent::DocumentPathChange(doc_id, original_path, new_path) => {
-                if let Some(path) = original_path {
-                    self.path_doc_id.remove(&path);
-                    self.watcher.unwatch(path).unwrap();
-                }
-
-                debug_assert!(!self.path_doc_id.values().any(|d| *d == doc_id));
-                self.path_doc_id.insert(new_path.clone(), doc_id);
-                self.watcher
-                    .watch(new_path, RecursiveMode::NonRecursive)
-                    .unwrap();
-            }
-            AutoReloadEvent::DocumentsModified(paths) => {
-                for path in paths {
-                    self.queue_modified_file(&path);
-                }
-            }
-            AutoReloadEvent::ReloadAllDocuments => {
-                let paths: Vec<PathBuf> = self.path_doc_id.keys().cloned().collect();
-                for path in paths {
-                    self.queue_modified_file(&path);
-                }
-            }
-        };
-
-        self.handle_external_updates();
-        None
-    }
-
-    fn finish_debounce(&mut self) {
-        unreachable!();
-    }
-}
-
 pub(super) fn register_hooks(handlers: &Handlers) {
     // TODO: Handle renames
     let tx = handlers.auto_reload.clone();
     register_hook!(move |event: &mut DocumentDidOpen<'_>| {
         let path = event.editor.documents.get(&event.doc).unwrap().path();
+
+        log::info!("Document opened!");
 
         if let Some(p) = path {
             helix_event::send_blocking(&tx, AutoReloadEvent::DocumentOpen(p.clone(), event.doc));
@@ -253,18 +218,6 @@ pub(super) fn register_hooks(handlers: &Handlers) {
         if let Some(p) = path {
             helix_event::send_blocking(&tx, AutoReloadEvent::DocumentClose(p.clone()));
         }
-        Ok(())
-    });
-
-    let tx = handlers.auto_reload.clone();
-    register_hook!(move |event: &mut FileModified| {
-        // TODO: Add To/From traits
-        let internal_event = match &event.event {
-            FileModifiedType::Paths(p) => AutoReloadEvent::DocumentsModified(p.clone()),
-            FileModifiedType::NeedRescan => AutoReloadEvent::ReloadAllDocuments,
-        };
-
-        helix_event::send_blocking(&tx, internal_event);
         Ok(())
     });
 

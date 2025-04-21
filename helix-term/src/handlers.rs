@@ -20,6 +20,7 @@ mod diagnostics;
 mod document_colors;
 mod signature_help;
 mod snippet;
+pub mod watcher;
 
 pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     events::register();
@@ -27,7 +28,7 @@ pub fn setup(config: Arc<ArcSwap<Config>>) -> Handlers {
     let event_tx = completion::CompletionHandler::new(config).spawn();
     let signature_hints = SignatureHelpHandler::new().spawn();
     let auto_save = AutoSaveHandler::new().spawn();
-    let auto_reload = AutoReloadHandler::new().spawn();
+    let auto_reload = AutoReloadHandler::new().start();
     let document_colors = DocumentColorsHandler::default().spawn();
 
     let handlers = Handlers {

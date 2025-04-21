@@ -97,8 +97,8 @@ rmp-serde = "1.3.0"
 tokio-util = { version = "0.7.15", features = ["io", "io-util"] }
 async-stream = "0.3.6"
 
-# notify for autoreload
-notify-debouncer-full = "0.4.0"
+inotify = "0.11.0"
+libc = "0.2.172"
 
 [target.'cfg(not(windows))'.dependencies]  # https://github.com/vorner/signal-hook/issues/100
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
@@ -106,6 +106,7 @@ libc = "0.2.174"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crossterm = { version = "0.28", features = ["event-stream", "use-dev-tty"] }
+kqueue = "1.0.8"
 
 [build-dependencies]
 helix-loader = { path = "../helix-loader" }
