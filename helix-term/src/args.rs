@@ -4,7 +4,7 @@ use helix_view::tree::Layout;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Args {
     pub display_help: bool,
     pub display_version: bool,
@@ -19,6 +19,7 @@ pub struct Args {
     pub config_file: Option<PathBuf>,
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
+    pub foreground_server: bool,
 }
 
 impl Args {
@@ -31,7 +32,8 @@ impl Args {
             let (filename, position) = parse_file(file_with_position);
 
             // Before setting the working directory, resolve all the paths in args.files
-            let filename = helix_stdx::path::canonicalize(filename);
+            let filename =
+                helix_stdx::path::canonicalize(helix_stdx::env::current_working_dir(), filename);
 
             args.files
                 .entry(filename)
@@ -47,6 +49,7 @@ impl Args {
                 "--version" => args.display_version = true,
                 "--help" => args.display_help = true,
                 "--tutor" => args.load_tutor = true,
+                "--server" => args.foreground_server = true,
                 "--vsplit" => match args.split {
                     Some(_) => anyhow::bail!("can only set a split once of a specific type"),
                     None => args.split = Some(Layout::Vertical),

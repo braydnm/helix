@@ -60,3 +60,6 @@ repository = "https://github.com/helix-editor/helix"
 homepage = "https://helix-editor.com"
 license = "MPL-2.0"
 rust-version = "1.82"
+
+[patch.crates-io]
+crossterm = { git = "ssh://github.com/braydnm/crossterm.git" }

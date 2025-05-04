@@ -14,11 +14,13 @@ use helix_view::{
 use crate::ui::ProgressSpinners;
 
 use helix_view::editor::StatusLineElement as StatusLineElementID;
+use helix_view::ClientId;
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
 
 pub struct RenderContext<'a> {
     pub editor: &'a Editor,
+    pub client_id: ClientId,
     pub doc: &'a Document,
     pub view: &'a View,
     pub focused: bool,
@@ -29,6 +31,7 @@ pub struct RenderContext<'a> {
 impl<'a> RenderContext<'a> {
     pub fn new(
         editor: &'a Editor,
+        client_id: ClientId,
         doc: &'a Document,
         view: &'a View,
         focused: bool,
@@ -36,6 +39,7 @@ impl<'a> RenderContext<'a> {
     ) -> Self {
         RenderContext {
             editor,
+            client_id,
             doc,
             view,
             focused,
@@ -171,7 +175,7 @@ where
     let content = if visible {
         Cow::Owned(format!(
             " {} ",
-            match context.editor.mode() {
+            match client!(context.editor, context.client_id).mode {
                 Mode::Insert => &modenames.insert,
                 Mode::Select => &modenames.select,
                 Mode::Normal => &modenames.normal,
@@ -182,7 +186,7 @@ where
         Cow::Borrowed("     ")
     };
     let style = if visible && config.color_modes {
-        match context.editor.mode() {
+        match client!(context.editor, context.client_id).mode {
             Mode::Insert => context.editor.theme.get("ui.statusline.insert"),
             Mode::Select => context.editor.theme.get("ui.statusline.select"),
             Mode::Normal => context.editor.theme.get("ui.statusline.normal"),
@@ -450,7 +454,9 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     let title = {
-        let rel_path = context.doc.relative_path();
+        let rel_path = context
+            .doc
+            .relative_path(client!(context.editor, context.client_id).cwd.as_path());
         let path = rel_path
             .as_ref()
             .map(|p| p.to_string_lossy())
@@ -507,7 +513,9 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     let title = {
-        let rel_path = context.doc.relative_path();
+        let rel_path = context
+            .doc
+            .relative_path(client!(context.editor, context.client_id).cwd.as_path());
         let path = rel_path
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
@@ -552,7 +560,7 @@ fn render_register<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    if let Some(reg) = context.editor.selected_register {
+    if let Some(reg) = client!(context.editor, context.client_id).selected_register {
         write(context, format!(" reg={} ", reg).into())
     }
 }

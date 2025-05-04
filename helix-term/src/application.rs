@@ -1,12 +1,14 @@
 use arc_swap::{access::Map, ArcSwap};
+use async_stream::stream;
+use crossterm::terminal::winch_signal_receiver;
 use futures_util::Stream;
-use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
+use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Position, Range, Selection};
 use helix_lsp::{
     lsp::{self, notification::Notification},
     util::lsp_range_to_range,
     LanguageServerId, LspProgressMap,
 };
-use helix_stdx::path::get_relative_path;
+use helix_stdx::socket::read_fd;
 use helix_view::{
     align_view,
     document::{DocumentOpenError, DocumentSavedEventResult},
@@ -14,9 +16,18 @@ use helix_view::{
     graphics::Rect,
     theme,
     tree::Layout,
-    Align, Editor,
+    Align, ClientId, Editor,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::task::spawn_blocking;
+use tokio::{
+    io::AsyncWriteExt,
+    net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
+};
+use tokio_stream::StreamMap;
+use tokio_util::io::SyncIoBridge;
+
 use tui::backend::Backend;
 
 use crate::{
@@ -29,18 +40,22 @@ use crate::{
     ui::{self, overlay::overlaid},
 };
 
+use core::pin::Pin;
 use log::{debug, error, info, warn};
-#[cfg(not(feature = "integration"))]
-use std::io::stdout;
-use std::{io::stdin, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[cfg(not(windows))]
-use anyhow::Context;
 use anyhow::Error;
 
 use crossterm::{event::Event as CrosstermEvent, tty::IsTty};
 #[cfg(not(windows))]
-use {signal_hook::consts::signal, signal_hook_tokio::Signals};
+use signal_hook::consts::signal;
 #[cfg(windows)]
 type Signals = futures_util::stream::Empty<()>;
 
@@ -51,21 +66,36 @@ use tui::backend::CrosstermBackend;
 use tui::backend::TestBackend;
 
 #[cfg(not(feature = "integration"))]
-type TerminalBackend = CrosstermBackend<std::io::Stdout>;
+type TerminalBackend = CrosstermBackend;
 
 #[cfg(feature = "integration")]
 type TerminalBackend = TestBackend;
 
 type Terminal = tui::terminal::Terminal<TerminalBackend>;
 
+type TerminalStream = Pin<Box<dyn Stream<Item = Result<CrosstermEvent, std::io::Error>> + Send>>;
+type SocketStream = Pin<Box<dyn Stream<Item = Option<i32>> + Send>>;
+
+pub struct ApplicationClients {
+    map: HashMap<ClientId, ApplicationClient>,
+    terminal_streams: StreamMap<ClientId, TerminalStream>,
+    socket_streams: StreamMap<ClientId, SocketStream>,
+}
+
+impl ApplicationClients {
+    pub fn by_id(&mut self, id: ClientId) -> Option<&mut ApplicationClient> {
+        self.map.get_mut(&id)
+    }
+}
+
 pub struct Application {
-    compositor: Compositor,
-    terminal: Terminal,
+    clients: ApplicationClients,
+    listener: UnixListener,
+
     pub editor: Editor,
 
     config: Arc<ArcSwap<Config>>,
 
-    signals: Signals,
     jobs: Jobs,
     lsp_progress: LspProgressMap,
 }
@@ -92,30 +122,87 @@ fn setup_integration_logging() {
         .apply();
 }
 
-impl Application {
-    pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
-        #[cfg(feature = "integration")]
-        setup_integration_logging();
+pub struct ApplicationClient {
+    id: ClientId,
+    pgid: i32,
+    terminal: Terminal,
+    socket_tx: OwnedWriteHalf,
+    terminal_stream: Option<TerminalStream>,
+    pub compositor: Compositor,
+}
 
-        use helix_view::editor::Action;
-
-        let mut theme_parent_dirs = vec![helix_loader::config_dir()];
-        theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
-        let theme_loader = theme::Loader::new(&theme_parent_dirs);
-
+impl ApplicationClient {
+    pub fn new(
+        config: helix_view::editor::Config,
+        pgid: i32,
+        terminal: crossterm::terminal::Terminal,
+        socket_tx: OwnedWriteHalf,
+    ) -> Result<Self, Error> {
         #[cfg(not(feature = "integration"))]
-        let backend = CrosstermBackend::new(stdout(), &config.editor);
+        let backend = CrosstermBackend::new(terminal, &config);
 
         #[cfg(feature = "integration")]
         let backend = TestBackend::new(120, 150);
 
         let terminal = Terminal::new(backend)?;
         let area = terminal.size().expect("couldn't get terminal size");
-        let mut compositor = Compositor::new(area);
+        let compositor = Compositor::new(area);
+
+        Ok(ApplicationClient {
+            id: ClientId::default(),
+            pgid,
+            terminal,
+            socket_tx,
+            terminal_stream: None,
+            compositor,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ClientInfo {
+    cwd: PathBuf,
+    load_tutor: bool,
+    split: Option<Layout>,
+    files: Vec<(PathBuf, Vec<Position>)>,
+    pub pgid: i32,
+    pub has_stdin: bool,
+}
+
+impl ClientInfo {
+    pub fn from_args(args: &Args) -> Self {
+        Self {
+            cwd: helix_stdx::env::current_working_dir(),
+            load_tutor: args.load_tutor,
+            split: args.split,
+            files: args
+                .files
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            // SAFETY: It's perfectly safe, I assure you.
+            pgid: unsafe { libc::getpgrp() },
+            has_stdin: unsafe { libc::isatty(libc::STDIN_FILENO) == 0 },
+        }
+    }
+}
+
+impl Application {
+    pub fn new(
+        config: Config,
+        lang_loader: syntax::Loader,
+        listener: UnixListener,
+    ) -> Result<Self, Error> {
+        #[cfg(feature = "integration")]
+        setup_integration_logging();
+
+        let mut theme_parent_dirs = vec![helix_loader::config_dir()];
+        theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
+        let theme_loader = theme::Loader::new(&theme_parent_dirs);
+
         let config = Arc::new(ArcSwap::from_pointee(config));
         let handlers = handlers::setup(config.clone());
-        let mut editor = Editor::new(
-            area,
+        let editor = Editor::new(
             Arc::new(theme_loader),
             Arc::new(ArcSwap::from_pointee(lang_loader)),
             Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
@@ -123,26 +210,103 @@ impl Application {
             })),
             handlers,
         );
-        Self::load_configured_theme(&mut editor, &config.load());
 
-        let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
+        let app = Self {
+            clients: ApplicationClients {
+                map: HashMap::new(),
+                terminal_streams: StreamMap::new(),
+                socket_streams: StreamMap::new(),
+            },
+
+            editor,
+            listener,
+
+            config,
+
+            jobs: Jobs::new(),
+            lsp_progress: LspProgressMap::new(),
+        };
+
+        Ok(app)
+    }
+
+    pub fn add_client(
+        &mut self,
+        info: ClientInfo,
+        tty: File,
+        mut stdin: Option<File>,
+        socket: UnixStream,
+    ) -> Result<ClientId, Error> {
+        use helix_view::editor::Action;
+
+        let (rx, tx) = socket.into_split();
+        let mut client = ApplicationClient::new(
+            self.config.load().editor.clone(),
+            info.pgid,
+            crossterm::terminal::Terminal::new(tty, winch_signal_receiver()?),
+            tx,
+        )?;
+        let client_id = self.editor.add_client(client.compositor.size(), info.cwd);
+        client.id = client_id;
+        self.clients.map.insert(client_id, client);
+        let client = self.clients.map.get_mut(&client_id).unwrap();
+
+        let mut terminal_input = client.terminal.backend_mut().take_input_stream();
+        let terminal_event = Box::pin(stream! {
+            use futures_util::StreamExt;
+            while let Some(event) = terminal_input.next().await {
+                yield event;
+            }
+        });
+        self.clients
+            .terminal_streams
+            .insert(client_id, terminal_event);
+
+        let socket_event = Box::pin(stream! {
+            loop {
+                 if rx.readable().await.is_err() {
+                     yield None;
+                     break;
+                 }
+                 let mut msg = [0];
+                 match rx.try_read(&mut msg) {
+                     Ok(0) => {
+                         yield None;
+                         break;
+                     }
+                     Ok(_) => {
+                         yield Some(msg[0] as i32);
+                     }
+                     Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                         continue;
+                     }
+                     Err(_) => {
+                         yield None;
+                         break;
+                     }
+                 }
+            }
+        });
+        self.clients.socket_streams.insert(client_id, socket_event);
+
+        let keys = Box::new(Map::new(Arc::clone(&self.config), |config: &Config| {
             &config.keys
         }));
         let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys)));
-        compositor.push(editor_view);
+        client.compositor.push(editor_view);
 
-        if args.load_tutor {
+        if info.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
-            editor.open(&path, Action::VerticalSplit)?;
+            self.editor.open(client_id, &path, Action::VerticalSplit)?;
             // Unset path to prevent accidentally saving to the original tutor file.
-            doc_mut!(editor).set_path(None);
-        } else if !args.files.is_empty() {
-            let mut files_it = args.files.into_iter().peekable();
+            doc_mut!(self.editor, client_id).set_path(None);
+        } else if !info.files.is_empty() {
+            let mut files_it = info.files.into_iter().peekable();
 
             // If the first file is a directory, skip it and open a picker
             if let Some((first, _)) = files_it.next_if(|(p, _)| p.is_dir()) {
-                let picker = ui::file_picker(&editor, first);
-                compositor.push(Box::new(overlaid(picker)));
+                let picker = ui::file_picker(&self.editor, client_id, first);
+                client.compositor.push(Box::new(overlaid(picker)));
             }
 
             // If there are any more files specified, open them
@@ -160,14 +324,14 @@ impl Application {
                         // files will be opened according to the selected
                         // option. If neither of those two arguments are passed
                         // in, just load the files normally.
-                        let action = match args.split {
+                        let action = match info.split {
                             _ if nr_of_files == 1 => Action::VerticalSplit,
                             Some(Layout::Vertical) => Action::VerticalSplit,
                             Some(Layout::Horizontal) => Action::HorizontalSplit,
                             None => Action::Load,
                         };
-                        let old_id = editor.document_id_by_path(&file);
-                        let doc_id = match editor.open(&file, action) {
+                        let old_id = self.editor.document_id_by_path(&file);
+                        let doc_id = match self.editor.open(client_id, &file, action) {
                             // Ignore irregular files during application init.
                             Err(DocumentOpenError::IrregularFile) => {
                                 nr_of_files -= 1;
@@ -185,8 +349,8 @@ impl Application {
                         // NOTE: this isn't necessarily true anymore. If
                         // `--vsplit` or `--hsplit` are used, the file which is
                         // opened last is focused on.
-                        let view_id = editor.tree.focus;
-                        let doc = doc_mut!(editor, &doc_id);
+                        let view_id = client!(self.editor, client_id).tree.focus;
+                        let doc = doc_with_id_mut!(self.editor, &doc_id);
                         let selection = pos
                             .into_iter()
                             .map(|coords| {
@@ -198,107 +362,126 @@ impl Application {
                 }
 
                 // if all files were invalid, replace with empty buffer
-                if nr_of_files == 0 {
-                    editor.new_file(Action::VerticalSplit);
+                if client!(self.editor, client_id)
+                    .tree
+                    .is_empty(&self.editor.views)
+                {
+                    self.editor.new_file(client_id, Action::VerticalSplit);
                 } else {
-                    editor.set_status(format!(
-                        "Loaded {} file{}.",
-                        nr_of_files,
-                        if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
-                    ));
+                    if nr_of_files != 0 {
+                        self.editor.set_status(format!(
+                            "Loaded {} file{}.",
+                            nr_of_files,
+                            if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
+                        ));
+                    }
                     // align the view to center after all files are loaded,
                     // does not affect views without pos since it is at the top
-                    let (view, doc) = current!(editor);
+                    let (_client, view, doc) = current!(self.editor, client_id);
                     align_view(doc, view, Align::Center);
                 }
             } else {
-                editor.new_file(Action::VerticalSplit);
+                self.editor.new_file(client_id, Action::VerticalSplit);
             }
-        } else if stdin().is_tty() || cfg!(feature = "integration") {
-            editor.new_file(Action::VerticalSplit);
+        } else if stdin.is_none() || cfg!(feature = "integration") {
+            self.editor.new_file(client_id, Action::VerticalSplit);
         } else {
-            editor
-                .new_file_from_stdin(Action::VerticalSplit)
-                .unwrap_or_else(|_| editor.new_file(Action::VerticalSplit));
+            self.editor
+                .new_file_from_reader(client_id, Action::VerticalSplit, stdin.as_mut().unwrap())
+                .unwrap_or_else(|_| self.editor.new_file(client_id, Action::VerticalSplit));
         }
 
-        #[cfg(windows)]
-        let signals = futures_util::stream::empty();
-        #[cfg(not(windows))]
-        let signals = Signals::new([
-            signal::SIGTSTP,
-            signal::SIGCONT,
-            signal::SIGUSR1,
-            signal::SIGTERM,
-            signal::SIGINT,
-        ])
-        .context("build signal handler")?;
+        Self::load_configured_theme(&mut self.editor, &self.config.load());
 
-        let app = Self {
-            compositor,
-            terminal,
-            editor,
-            config,
-            signals,
-            jobs: Jobs::new(),
-            lsp_progress: LspProgressMap::new(),
-        };
+        Ok(client_id)
+    }
 
-        Ok(app)
+    pub async fn accept_client(
+        &mut self,
+        client_sock: tokio::net::UnixStream,
+    ) -> anyhow::Result<()> {
+        let mut client_io_bridge = SyncIoBridge::new(client_sock);
+        let (client_info, client_tty, client_stdin, client_io_bridge) = spawn_blocking(move || {
+            let client_info: ClientInfo = rmp_serde::from_read(&mut client_io_bridge)?;
+            let client_tty = read_fd(client_io_bridge.as_mut())?;
+            let client_stdin = if client_info.has_stdin {
+                Some(read_fd(client_io_bridge.as_mut())?)
+            } else {
+                None
+            };
+
+            anyhow::Ok((client_info, client_tty, client_stdin, client_io_bridge))
+        })
+        .await??;
+        let client_id = self.add_client(
+            client_info,
+            client_tty,
+            client_stdin,
+            client_io_bridge.into_inner(),
+        )?;
+        Application::claim_term(self.clients.map.get_mut(&client_id).unwrap(), &self.config)
+            .await?;
+        self.editor.most_recent_client_id = Some(client_id);
+
+        Ok(())
     }
 
     async fn render(&mut self) {
-        if self.compositor.full_redraw {
-            self.terminal.clear().expect("Cannot clear the terminal");
-            self.compositor.full_redraw = false;
+        for (client_id, client) in self.clients.map.iter_mut() {
+            if client!(self.editor, *client_id).suspended {
+                continue;
+            }
+            Application::render_client(client, &mut self.editor, &mut self.jobs).await;
+        }
+    }
+
+    async fn render_client(client: &mut ApplicationClient, editor: &mut Editor, jobs: &mut Jobs) {
+        if client.compositor.full_redraw {
+            client.terminal.clear().expect("Cannot clear the terminal");
+            client.compositor.full_redraw = false;
         }
 
         let mut cx = crate::compositor::Context {
-            editor: &mut self.editor,
-            jobs: &mut self.jobs,
+            editor,
+            client_id: client.id,
+            jobs,
             scroll: None,
         };
 
         helix_event::start_frame();
         cx.editor.needs_redraw = false;
 
-        let area = self
+        let area = client
             .terminal
             .autoresize()
             .expect("Unable to determine terminal size");
 
         // TODO: need to recalculate view tree if necessary
 
-        let surface = self.terminal.current_buffer_mut();
+        let surface = client.terminal.current_buffer_mut();
 
-        self.compositor.render(area, surface, &mut cx);
-        let (pos, kind) = self.compositor.cursor(area, &self.editor);
+        client.compositor.render(area, surface, &mut cx);
+        let (pos, kind) = client.compositor.cursor(area, &editor, client.id);
         // reset cursor cache
-        self.editor.cursor_cache.reset();
+        editor.cursor_cache.reset();
 
         let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
-        self.terminal.draw(pos, kind).unwrap();
+        client.terminal.draw(pos, kind).unwrap();
     }
 
-    pub async fn event_loop<S>(&mut self, input_stream: &mut S)
-    where
-        S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
-    {
+    pub async fn event_loop(&mut self) {
         self.render().await;
 
         loop {
-            if !self.event_loop_until_idle(input_stream).await {
+            if !self.event_loop_until_idle().await {
                 break;
             }
         }
     }
 
-    pub async fn event_loop_until_idle<S>(&mut self, input_stream: &mut S) -> bool
-    where
-        S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
-    {
+    pub async fn event_loop_until_idle(&mut self) -> bool {
         loop {
-            if self.editor.should_close() {
+            if self.editor.exit_code.is_some() {
                 return false;
             }
 
@@ -307,16 +490,33 @@ impl Application {
             tokio::select! {
                 biased;
 
-                Some(signal) = self.signals.next() => {
-                    if !self.handle_signals(signal).await {
-                        return false;
-                    };
+                result = self.listener.accept() => {
+                    let (client_sock, _) = result.unwrap();
+                    self.accept_client(client_sock).await.unwrap();
+                    self.render().await;
                 }
-                Some(event) = input_stream.next() => {
-                    self.handle_terminal_events(event).await;
+                Some((client_id, signal)) = self.clients.socket_streams.next() => {
+                    if !self.handle_signals(client_id, signal).await {
+                        return false;
+                    }
+                }
+                Some((client_id, event)) = self.clients.terminal_streams.next() => {
+                    self.editor.most_recent_client_id = Some(client_id);
+                    if self.handle_terminal_events(client_id, event).await {
+                        self.render().await;
+                    }
+                    if self.editor.should_close(client_id) {
+                        let client = self.clients.map.get_mut(&client_id).unwrap();
+                        Application::restore_term(client, &self.config).unwrap();
+                        client.socket_tx.write_u8(client!(self.editor, client_id).exit_code as u8).await.unwrap();
+
+                        self.clients.map.remove(&client_id);
+                        self.clients.socket_streams.remove(&client_id);
+                        self.clients.terminal_streams.remove(&client_id);
+                    }
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
+                    self.jobs.handle_callback(&mut self.editor, &mut self.clients, Ok(Some(callback)));
                     self.render().await;
                 }
                 Some(msg) = self.jobs.status_messages.recv() => {
@@ -331,7 +531,7 @@ impl Application {
                     helix_event::request_redraw();
                 }
                 Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
+                    self.jobs.handle_callback(&mut self.editor, &mut self.clients, callback);
                     self.render().await;
                 }
                 event = self.editor.wait_event() => {
@@ -367,9 +567,17 @@ impl Application {
             ConfigEvent::Update(editor_config) => {
                 let mut app_config = (*self.config.load().clone()).clone();
                 app_config.editor = *editor_config;
-                if let Err(err) = self.terminal.reconfigure(app_config.editor.clone().into()) {
-                    self.editor.set_error(err.to_string());
-                };
+                for (client_id, client) in self.clients.map.iter_mut() {
+                    if client!(self.editor, *client_id).suspended {
+                        continue;
+                    }
+                    if let Err(err) = client
+                        .terminal
+                        .reconfigure(app_config.editor.clone().into())
+                    {
+                        self.editor.set_error(err.to_string());
+                    }
+                }
                 self.config.store(Arc::new(app_config));
             }
         }
@@ -380,8 +588,8 @@ impl Application {
 
         // reset view position in case softwrap was enabled/disabled
         let scrolloff = self.editor.config().scrolloff;
-        for (view, _) in self.editor.tree.views() {
-            let doc = doc_mut!(self.editor, &view.doc);
+        for view in self.editor.views.iter() {
+            let doc = doc_with_id_mut!(self.editor, &view.doc);
             view.ensure_cursor_in_view(doc, scrolloff);
         }
     }
@@ -412,8 +620,14 @@ impl Application {
                 document.replace_diagnostics(diagnostics, &[], None);
             }
 
-            self.terminal
-                .reconfigure(default_config.editor.clone().into())?;
+            for (client_id, client) in self.clients.map.iter_mut() {
+                if client!(self.editor, *client_id).suspended {
+                    continue;
+                }
+                client
+                    .terminal
+                    .reconfigure(default_config.editor.clone().into())?;
+            }
             // Store new config
             self.config.store(Arc::new(default_config));
             Ok(())
@@ -466,44 +680,60 @@ impl Application {
         true
     }
 
+    pub async fn suspend_client(
+        client: &mut ApplicationClient,
+        config: &Arc<ArcSwap<Config>>,
+        terminal_streams: &mut StreamMap<ClientId, TerminalStream>,
+    ) {
+        Application::restore_term(client, config).unwrap();
+        client.terminal_stream = terminal_streams.remove(&client.id);
+
+        // SAFETY:
+        //
+        // - helix must have permissions to send signals to all processes in its signal
+        //   group, either by already having the requisite permission, or by having the
+        //   user's UID / EUID / SUID match that of the receiving process(es).
+        let res = unsafe {
+            // A pid of -pgid sends the signal to the entire process group, allowing the user to
+            // regain control of their terminal if the editor was spawned under another process
+            // (e.g. when running `git commit`).
+            //
+            // We have to send SIGSTOP (not SIGTSTP) to the entire process group, because,
+            // as mentioned above, the terminal will get stuck if `helix` was spawned from
+            // an external process and that process waits for `helix` to complete. This may
+            // be an issue with signal-hook-tokio, but the author of signal-hook believes it
+            // could be a tokio issue instead:
+            // https://github.com/vorner/signal-hook/issues/132
+            libc::kill(-client.pgid, signal::SIGSTOP)
+        };
+
+        if res != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("{}", err);
+            let res = err.raw_os_error().unwrap_or(1);
+            std::process::exit(res);
+        }
+    }
+
     #[cfg(not(windows))]
-    pub async fn handle_signals(&mut self, signal: i32) -> bool {
+    pub async fn handle_signals(&mut self, client_id: ClientId, signal: Option<i32>) -> bool {
+        let client = self.clients.map.get_mut(&client_id).unwrap();
         match signal {
-            signal::SIGTSTP => {
-                self.restore_term().unwrap();
-
-                // SAFETY:
-                //
-                // - helix must have permissions to send signals to all processes in its signal
-                //   group, either by already having the requisite permission, or by having the
-                //   user's UID / EUID / SUID match that of the receiving process(es).
-                let res = unsafe {
-                    // A pid of 0 sends the signal to the entire process group, allowing the user to
-                    // regain control of their terminal if the editor was spawned under another process
-                    // (e.g. when running `git commit`).
-                    //
-                    // We have to send SIGSTOP (not SIGTSTP) to the entire process group, because,
-                    // as mentioned above, the terminal will get stuck if `helix` was spawned from
-                    // an external process and that process waits for `helix` to complete. This may
-                    // be an issue with signal-hook-tokio, but the author of signal-hook believes it
-                    // could be a tokio issue instead:
-                    // https://github.com/vorner/signal-hook/issues/132
-                    libc::kill(0, signal::SIGSTOP)
-                };
-
-                if res != 0 {
-                    let err = std::io::Error::last_os_error();
-                    eprintln!("{}", err);
-                    let res = err.raw_os_error().unwrap_or(1);
-                    std::process::exit(res);
-                }
+            Some(signal::SIGTSTP) => {
+                client_mut!(self.editor, client.id).suspended = true;
+                Application::suspend_client(
+                    client,
+                    &self.config,
+                    &mut self.clients.terminal_streams,
+                )
+                .await;
             }
-            signal::SIGCONT => {
+            Some(signal::SIGCONT) => {
                 // Copy/Paste from same issue from neovim:
                 // https://github.com/neovim/neovim/issues/12322
                 // https://github.com/neovim/neovim/pull/13084
                 for retries in 1..=10 {
-                    match self.claim_term().await {
+                    match Application::claim_term(client, &self.config).await {
                         Ok(()) => break,
                         Err(err) if retries == 10 => panic!("Failed to claim terminal: {}", err),
                         Err(_) => continue,
@@ -511,19 +741,60 @@ impl Application {
                 }
 
                 // redraw the terminal
-                let area = self.terminal.size().expect("couldn't get terminal size");
-                self.compositor.resize(area);
-                self.terminal.clear().expect("couldn't clear terminal");
+                let area = client.terminal.size().expect("couldn't get terminal size");
+                client.compositor.resize(area);
+                client.terminal.clear().expect("couldn't clear terminal");
 
-                self.render().await;
+                client_mut!(self.editor, client.id).suspended = false;
+                self.clients
+                    .terminal_streams
+                    .insert(client.id, client.terminal_stream.take().unwrap());
+                Application::render_client(client, &mut self.editor, &mut self.jobs).await;
             }
-            signal::SIGUSR1 => {
+            Some(signal::SIGWINCH) => {
+                let mut cx = crate::compositor::Context {
+                    editor: &mut self.editor,
+                    client_id: client.id,
+                    jobs: &mut self.jobs,
+                    scroll: None,
+                };
+                let area = client.terminal.size().expect("couldn't get terminal size");
+                client
+                    .terminal
+                    .resize(area)
+                    .expect("Unable to resize terminal");
+
+                client.compositor.resize(area);
+
+                client
+                    .compositor
+                    .handle_event(&Event::Resize(area.width, area.height), &mut cx);
+                Application::render_client(client, &mut self.editor, &mut self.jobs).await;
+            }
+            Some(signal::SIGUSR1) => {
                 self.refresh_config();
-                self.render().await;
+                let client = self.clients.map.get_mut(&client_id).unwrap();
+                Application::render_client(client, &mut self.editor, &mut self.jobs).await;
             }
-            signal::SIGTERM | signal::SIGINT => {
-                self.restore_term().unwrap();
-                return false;
+            Some(signal::SIGTERM) | Some(signal::SIGINT) | None => {
+                // Termination signal to client process or client EOF, indicating that the client
+                // was forcibly killed (e.g. SIGKILL) or crashed. Handled by force quitting all views in
+                // the client.
+                if !client!(self.editor, client_id).suspended {
+                    // This may fail if the terminal emulator was closed or crashed, so discard the error.
+                    let _ = Application::restore_term(client, &self.config);
+                }
+                while !self.editor.should_close(client_id) {
+                    self.editor
+                        .close(client!(self.editor, client_id).tree.focus);
+                }
+
+                // This may fail if the client process died, so discard the error.
+                let _ = client.socket_tx.write_u8(client!(self.editor, client_id).exit_code as u8).await;
+
+                self.clients.map.remove(&client_id);
+                self.clients.socket_streams.remove(&client_id);
+                self.clients.terminal_streams.remove(&client_id);
             }
             _ => unreachable!(),
         }
@@ -532,12 +803,19 @@ impl Application {
     }
 
     pub async fn handle_idle_timeout(&mut self) {
-        let mut cx = crate::compositor::Context {
-            editor: &mut self.editor,
-            jobs: &mut self.jobs,
-            scroll: None,
-        };
-        let should_render = self.compositor.handle_event(&Event::IdleTimeout, &mut cx);
+        let mut should_render = false;
+        for (client_id, client) in self.clients.map.iter_mut() {
+            if client!(self.editor, *client_id).suspended {
+                continue;
+            }
+            let mut cx = crate::compositor::Context {
+                editor: &mut self.editor,
+                client_id: *client_id,
+                jobs: &mut self.jobs,
+                scroll: None,
+            };
+            should_render |= client.compositor.handle_event(&Event::IdleTimeout, &mut cx);
+        }
         if should_render || self.editor.needs_redraw {
             self.render().await;
         }
@@ -587,7 +865,7 @@ impl Application {
         // TODO: fix being overwritten by lsp
         self.editor.set_status(format!(
             "'{}' written, {}L {:.1}{}",
-            get_relative_path(&doc_save_event.path).to_string_lossy(),
+            &doc_save_event.path.to_string_lossy(),
             lines,
             sz,
             SUFFIX[i],
@@ -613,7 +891,7 @@ impl Application {
                 helix_event::request_redraw();
             }
             EditorEvent::DebuggerEvent((id, payload)) => {
-                let needs_render = self.editor.handle_debugger_message(id, payload).await;
+                let needs_render = self.editor.handle_debugger_message(self.editor.most_recent_client_id.unwrap(), id, payload).await;
                 if needs_render {
                     self.render().await;
                 }
@@ -635,24 +913,36 @@ impl Application {
         false
     }
 
-    pub async fn handle_terminal_events(&mut self, event: std::io::Result<CrosstermEvent>) {
+    pub async fn handle_terminal_events(
+        &mut self,
+        client_id: ClientId,
+        event: std::io::Result<CrosstermEvent>,
+    ) -> bool {
+        let client = self.clients.map.get_mut(&client_id).unwrap();
+        if client!(self.editor, client.id).suspended {
+            return false;
+        }
+
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
+            client_id: client.id,
             jobs: &mut self.jobs,
             scroll: None,
         };
         // Handle key events
         let should_redraw = match event.unwrap() {
             CrosstermEvent::Resize(width, height) => {
-                self.terminal
+                client
+                    .terminal
                     .resize(Rect::new(0, 0, width, height))
                     .expect("Unable to resize terminal");
 
-                let area = self.terminal.size().expect("couldn't get terminal size");
+                let area = client.terminal.size().expect("couldn't get terminal size");
 
-                self.compositor.resize(area);
+                client.compositor.resize(area);
 
-                self.compositor
+                client
+                    .compositor
                     .handle_event(&Event::Resize(width, height), &mut cx)
             }
             // Ignore keyboard release events.
@@ -660,12 +950,16 @@ impl Application {
                 kind: crossterm::event::KeyEventKind::Release,
                 ..
             }) => false,
-            event => self.compositor.handle_event(&event.into(), &mut cx),
+            event => client.compositor.handle_event(&event.into(), &mut cx),
         };
 
-        if should_redraw && !self.editor.should_close() {
-            self.render().await;
+        let suspended = client!(self.editor, client.id).suspended;
+        if suspended {
+            Application::suspend_client(client, &self.config, &mut self.clients.terminal_streams)
+                .await;
         }
+
+        should_redraw && !self.editor.should_close(client.id) && !suspended
     }
 
     pub async fn handle_language_server_message(
@@ -759,11 +1053,19 @@ impl Application {
                         log::info!("window/logMessage: {:?}", params);
                     }
                     Notification::ProgressMessage(params)
-                        if !self
-                            .compositor
-                            .has_component(std::any::type_name::<ui::Prompt>()) =>
+                        if self
+                            .clients
+                            .by_id(self.editor.most_recent_client_id.unwrap())
+                            .is_some_and(|client| {
+                                !client
+                                    .compositor
+                                    .has_component(std::any::type_name::<ui::Prompt>())
+                            }) =>
                     {
                         let editor_view = self
+                            .clients
+                            .by_id(self.editor.most_recent_client_id.unwrap())
+                            .unwrap()
                             .compositor
                             .find::<ui::EditorView>()
                             .expect("expected at least one EditorView");
@@ -902,6 +1204,9 @@ impl Application {
                         self.lsp_progress.create(server_id, params.token);
 
                         let editor_view = self
+                            .clients
+                            .by_id(self.editor.most_recent_client_id.unwrap())
+                            .unwrap()
                             .compositor
                             .find::<ui::EditorView>()
                             .expect("expected at least one EditorView");
@@ -916,9 +1221,11 @@ impl Application {
                         let language_server = language_server!();
                         if language_server.is_initialized() {
                             let offset_encoding = language_server.offset_encoding();
-                            let res = self
-                                .editor
-                                .apply_workspace_edit(offset_encoding, &params.edit);
+                            let res = self.editor.apply_workspace_edit(
+                                self.editor.most_recent_client_id.unwrap(),
+                                offset_encoding,
+                                &params.edit,
+                            );
 
                             Ok(json!(lsp::ApplyWorkspaceEditResponse {
                                 applied: res.is_ok(),
@@ -1072,7 +1379,8 @@ impl Application {
             _ => helix_view::editor::Action::VerticalSplit,
         };
 
-        let doc_id = match self.editor.open(path, action) {
+        let most_recent_client = self.editor.most_recent_client_id.unwrap();
+        let doc_id = match self.editor.open(most_recent_client, path, action) {
             Ok(id) => id,
             Err(err) => {
                 log::error!("failed to open path: {:?}: {:?}", uri, err);
@@ -1080,11 +1388,11 @@ impl Application {
             }
         };
 
-        let doc = doc_mut!(self.editor, &doc_id);
+        let doc = doc_with_id_mut!(self.editor, &doc_id);
         if let Some(range) = selection {
             // TODO: convert inside server
             if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding) {
-                let view = view_mut!(self.editor);
+                let view = client_view_mut!(self.editor, most_recent_client);
 
                 // we flip the range so that the cursor sits on the start of the symbol
                 // (for example start of the function).
@@ -1099,27 +1407,29 @@ impl Application {
         lsp::ShowDocumentResult { success: true }
     }
 
-    async fn claim_term(&mut self) -> std::io::Result<()> {
-        let terminal_config = self.config.load().editor.clone().into();
-        self.terminal.claim(terminal_config)
+    async fn claim_term(
+        client: &mut ApplicationClient,
+        config: &Arc<ArcSwap<Config>>,
+    ) -> std::io::Result<()> {
+        let terminal_config = &config.load().editor;
+        client.terminal.claim(terminal_config.clone().into())
     }
 
-    fn restore_term(&mut self) -> std::io::Result<()> {
-        let terminal_config = self.config.load().editor.clone().into();
+    fn restore_term(
+        client: &mut ApplicationClient,
+        config: &Arc<ArcSwap<Config>>,
+    ) -> std::io::Result<()> {
+        let terminal_config = &config.load().editor;
         use helix_view::graphics::CursorKind;
-        self.terminal
+        client
+            .terminal
             .backend_mut()
             .show_cursor(CursorKind::Block)
             .ok();
-        self.terminal.restore(terminal_config)
+        client.terminal.restore(terminal_config.clone().into())
     }
 
-    pub async fn run<S>(&mut self, input_stream: &mut S) -> Result<i32, Error>
-    where
-        S: Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
-    {
-        self.claim_term().await?;
-
+    pub async fn run(&mut self) -> Result<i32, Error> {
         // Exit the alternate screen and disable raw mode before panicking
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -1130,18 +1440,23 @@ impl Application {
             hook(info);
         }));
 
-        self.event_loop(input_stream).await;
+        self.event_loop().await;
 
         let close_errs = self.close().await;
 
-        self.restore_term()?;
+        for (client_id, client) in self.clients.map.iter_mut() {
+            if client!(self.editor, *client_id).suspended {
+                continue;
+            }
+            Application::restore_term(client, &self.config)?;
+        }
 
         for err in close_errs {
-            self.editor.exit_code = 1;
+            self.editor.exit_code = Some(1);
             eprintln!("Error: {}", err);
         }
 
-        Ok(self.editor.exit_code)
+        Ok(self.editor.exit_code.unwrap())
     }
 
     pub async fn close(&mut self) -> Vec<anyhow::Error> {
@@ -1152,7 +1467,7 @@ impl Application {
 
         if let Err(err) = self
             .jobs
-            .finish(&mut self.editor, Some(&mut self.compositor))
+            .finish(&mut self.editor, Some(&mut self.clients))
             .await
         {
             log::error!("Error executing job: {}", err);

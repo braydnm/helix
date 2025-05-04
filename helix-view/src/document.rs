@@ -16,13 +16,12 @@ use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
-use once_cell::sync::OnceCell;
+use rustix::path::Arg;
 use thiserror;
 
 use ::parking_lot::Mutex;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -48,7 +47,7 @@ use crate::{
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
     view::ViewPosition,
-    DocumentId, Editor, Theme, View, ViewId,
+    ClientId, DocumentId, Editor, Theme, View, ViewId,
 };
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
@@ -155,7 +154,6 @@ pub struct Document {
     pub inlay_hints_oudated: bool,
 
     path: Option<PathBuf>,
-    relative_path: OnceCell<Option<PathBuf>>,
     encoding: &'static encoding::Encoding,
     has_bom: bool,
 
@@ -324,14 +322,6 @@ impl fmt::Debug for DocumentInlayHintsId {
         f.debug_struct("DocumentInlayHintsId")
             .field("lines", &(self.first_line..self.last_line))
             .finish()
-    }
-}
-
-impl Editor {
-    pub(crate) fn clear_doc_relative_paths(&mut self) {
-        for doc in self.documents_mut() {
-            doc.relative_path.take();
-        }
     }
 }
 
@@ -695,7 +685,6 @@ impl Document {
             id: DocumentId::default(),
             active_snippet: None,
             path: None,
-            relative_path: OnceCell::new(),
             encoding,
             has_bom,
             text,
@@ -794,9 +783,10 @@ impl Document {
     pub fn auto_format(
         &self,
         editor: &Editor,
+        client_id: ClientId,
     ) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
         if self.language_config()?.auto_format {
-            self.format(editor)
+            self.format(editor, client_id)
         } else {
             None
         }
@@ -809,6 +799,7 @@ impl Document {
     pub fn format(
         &self,
         editor: &Editor,
+        client_id: ClientId,
     ) -> Option<BoxFuture<'static, Result<Transaction, FormatterError>>> {
         if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
@@ -822,7 +813,7 @@ impl Document {
         {
             log::debug!(
                 "formatting '{}' with command '{}', args {fmt_args:?}",
-                self.display_name(),
+                self.display_name(client!(editor, client_id).cwd.as_path()),
                 fmt_cmd.display(),
             );
             use std::process::Stdio;
@@ -836,7 +827,7 @@ impl Document {
 
             let args = match fmt_args
                 .iter()
-                .map(|content| expansion::expand(editor, Token::expand(content)))
+                .map(|content| expansion::expand(editor, client_id, Token::expand(content)))
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(args) => args,
@@ -965,7 +956,7 @@ impl Document {
         let text = self.text().clone();
 
         let path = match path {
-            Some(path) => helix_stdx::path::canonicalize(path),
+            Some(path) => path,
             None => {
                 if self.path.is_none() {
                     bail!("Can't save with no path set!");
@@ -1220,7 +1211,7 @@ impl Document {
             None => return Ok(()),
             Some(path) => match path.exists() {
                 true => path.to_owned(),
-                false => bail!("can't find file to reload from {:?}", self.display_name()),
+                false => bail!("can't find file to reload from {:?}", self.path()),
             },
         };
 
@@ -1269,15 +1260,9 @@ impl Document {
     /// observers (like LSP), in most cases `Editor::set_doc_path`
     /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
-        let path = path.map(helix_stdx::path::canonicalize);
-
-        // `take` to remove any prior relative path that may have existed.
-        // This will get set in `relative_path()`.
-        self.relative_path.take();
-
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
-        self.path = path;
+        self.path = path.map(|path| path.to_path_buf());
 
         self.detect_readonly();
         self.pickup_last_saved_time();
@@ -1298,7 +1283,7 @@ impl Document {
                     // config for the root language of the document. An error must have already
                     // been logged by `LanguageData::syntax_config`.
                     if err != syntax::HighlighterError::NoRootConfig {
-                        log::warn!("Error building syntax for '{}': {err}", self.display_name());
+                        log::warn!("Error building syntax {err}");
                     }
                 })
                 .ok()
@@ -1978,19 +1963,17 @@ impl Document {
         self.view_data_mut(view_id).view_position = new_offset;
     }
 
-    pub fn relative_path(&self) -> Option<&Path> {
-        self.relative_path
-            .get_or_init(|| {
-                self.path
-                    .as_ref()
-                    .map(|path| helix_stdx::path::get_relative_path(path).to_path_buf())
-            })
-            .as_deref()
+    pub fn relative_path(&self, cwd: &Path) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|path| helix_stdx::path::get_relative_path(cwd, path).to_path_buf())
     }
 
-    pub fn display_name(&self) -> Cow<'_, str> {
-        self.relative_path()
-            .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
+    pub fn display_name(&self, cwd: &Path) -> String {
+        self.relative_path(cwd).map_or_else(
+            || SCRATCH_BUFFER_NAME.to_string(),
+            |path| path.to_string_lossy().to_string(),
+        )
     }
 
     // transact(Fn) ?

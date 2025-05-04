@@ -29,7 +29,7 @@ use helix_view::{
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
-    Document, Editor, Theme, View,
+    ClientId, Document, Editor, Theme, View,
 };
 use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
 
@@ -77,6 +77,7 @@ impl EditorView {
     pub fn render_view(
         &self,
         editor: &Editor,
+        client_id: ClientId,
         doc: &Document,
         view: &View,
         viewport: Rect,
@@ -134,7 +135,7 @@ impl EditorView {
                 overlays.push(tabstops);
             }
             overlays.push(Self::doc_selection_highlights(
-                editor.mode(),
+                client!(editor, client_id).mode,
                 doc,
                 view,
                 theme,
@@ -150,6 +151,7 @@ impl EditorView {
         if !gutter_overflow {
             Self::render_gutter(
                 editor,
+                client_id,
                 doc,
                 view,
                 view.area,
@@ -219,8 +221,14 @@ impl EditorView {
             .clip_top(view.area.height.saturating_sub(1))
             .clip_bottom(1); // -1 from bottom to remove commandline
 
-        let mut context =
-            statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
+        let mut context = statusline::RenderContext::new(
+            editor,
+            client_id,
+            doc,
+            view,
+            is_focused,
+            &self.spinners,
+        );
 
         statusline::render(&mut context, statusline_area, surface);
     }
@@ -559,7 +567,12 @@ impl EditorView {
     }
 
     /// Render bufferline at the top
-    pub fn render_bufferline(editor: &Editor, viewport: Rect, surface: &mut Surface) {
+    pub fn render_bufferline(
+        editor: &Editor,
+        client_id: ClientId,
+        viewport: Rect,
+        surface: &mut Surface,
+    ) {
         let scratch = PathBuf::from(SCRATCH_BUFFER_NAME); // default filename to use for scratch buffer
         surface.clear_with(
             viewport,
@@ -580,7 +593,7 @@ impl EditorView {
             .unwrap_or_else(|| editor.theme.get("ui.statusline.inactive"));
 
         let mut x = viewport.x;
-        let current_doc = view!(editor).doc;
+        let current_doc = client_view!(editor, client_id).doc;
 
         for doc in editor.documents() {
             let fname = doc
@@ -613,6 +626,7 @@ impl EditorView {
 
     pub fn render_gutter<'d>(
         editor: &'d Editor,
+        client_id: ClientId,
         doc: &'d Document,
         view: &View,
         viewport: Rect,
@@ -635,7 +649,7 @@ impl EditorView {
         let gutter_selected_style_virtual = theme.get("ui.gutter.selected.virtual");
 
         for gutter_type in view.gutters() {
-            let mut gutter = gutter_type.style(editor, doc, view, theme, is_focused);
+            let mut gutter = gutter_type.style(editor, client_id, doc, view, theme, is_focused);
             let width = gutter_type.width(view, doc);
             // avoid lots of small allocations by reusing a text buffer for each line
             let mut text = String::with_capacity(width);
@@ -838,13 +852,14 @@ impl EditorView {
         let mut last_mode = mode;
         self.pseudo_pending.extend(self.keymaps.pending());
         let key_result = self.keymaps.get(mode, event);
-        cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
+        client_mut!(cxt.editor, cxt.client_id).autoinfo =
+            self.keymaps.sticky().map(|node| node.infobox());
 
         let mut execute_command = |command: &commands::MappableCommand| {
             command.execute(cxt);
             helix_event::dispatch(PostCommand { command, cx: cxt });
 
-            let current_mode = cxt.editor.mode();
+            let current_mode = client!(cxt.editor, cxt.client_id).mode;
             if current_mode != last_mode {
                 helix_event::dispatch(OnModeSwitch {
                     old_mode: last_mode,
@@ -869,7 +884,9 @@ impl EditorView {
             KeymapResult::Matched(command) => {
                 execute_command(command);
             }
-            KeymapResult::Pending(node) => cxt.editor.autoinfo = Some(node.infobox()),
+            KeymapResult::Pending(node) => {
+                client_mut!(cxt.editor, cxt.client_id).autoinfo = Some(node.infobox())
+            }
             KeymapResult::MatchedSequence(commands) => {
                 for command in commands {
                     execute_command(command);
@@ -910,7 +927,7 @@ impl EditorView {
     }
 
     fn command_mode(&mut self, mode: Mode, cxt: &mut commands::Context, event: KeyEvent) {
-        match (event, cxt.editor.count) {
+        match (event, client!(cxt.editor, cxt.client_id).count) {
             // If the count is already started and the input is a number, always continue the count.
             (key!(i @ '0'..='9'), Some(count)) => {
                 let i = i.to_digit(10).unwrap() as usize;
@@ -918,16 +935,16 @@ impl EditorView {
                 if count > 100_000_000 {
                     return;
                 }
-                cxt.editor.count = NonZeroUsize::new(count);
+                client_mut!(cxt.editor, cxt.client_id).count = NonZeroUsize::new(count);
             }
             // A non-zero digit will start the count if that number isn't used by a keymap.
             (key!(i @ '1'..='9'), None) if !self.keymaps.contains_key(mode, event) => {
                 let i = i.to_digit(10).unwrap() as usize;
-                cxt.editor.count = NonZeroUsize::new(i);
+                client_mut!(cxt.editor, cxt.client_id).count = NonZeroUsize::new(i);
             }
             // special handling for repeat operator
-            (key!('.'), _) if self.keymaps.pending().is_empty() => {
-                for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
+            (key!('.'), count) if self.keymaps.pending().is_empty() => {
+                for _ in 0..count.map_or(1, NonZeroUsize::into) {
                     // first execute whatever put us into insert mode
                     self.last_insert.0.execute(cxt);
                     let mut last_savepoint = None;
@@ -940,7 +957,7 @@ impl EditorView {
                                 trigger_offset,
                                 changes,
                             } => {
-                                let (view, doc) = current!(cxt.editor);
+                                let (_client, view, doc) = current!(cxt.editor, cxt.client_id);
 
                                 if let Some(last_savepoint) = last_savepoint.as_deref() {
                                     doc.restore(view, last_savepoint, true);
@@ -965,32 +982,34 @@ impl EditorView {
                                 last_savepoint = take(&mut last_request_savepoint);
                             }
                             InsertEvent::RequestCompletion => {
-                                let (view, doc) = current!(cxt.editor);
+                                let (_client, view, doc) = current!(cxt.editor, cxt.client_id);
                                 last_request_savepoint = Some(doc.savepoint(view));
                             }
                         }
                     }
                 }
-                cxt.editor.count = None;
+                client_mut!(cxt.editor, cxt.client_id).count = None;
             }
             _ => {
                 // set the count
-                cxt.count = cxt.editor.count;
+                let client = client_mut!(cxt.editor, cxt.client_id);
+                cxt.count = client.count;
                 // TODO: edge case: 0j -> reset to 1
                 // if this fails, count was Some(0)
                 // debug_assert!(cxt.count != 0);
 
                 // set the register
-                cxt.register = cxt.editor.selected_register.take();
+                cxt.register = client.selected_register.take();
 
                 let res = self.handle_keymap_event(mode, cxt, event);
                 if matches!(&res, Some(KeymapResult::NotFound)) {
                     self.on_next_key(OnKeyCallbackKind::Fallback, cxt, event);
                 }
+                let client = client_mut!(cxt.editor, cxt.client_id);
                 if self.keymaps.pending().is_empty() {
-                    cxt.editor.count = None
+                    client.count = None
                 } else {
-                    cxt.editor.selected_register = cxt.register.take();
+                    client.selected_register = cxt.register.take();
                 }
             }
         }
@@ -1000,18 +1019,19 @@ impl EditorView {
     pub fn set_completion(
         &mut self,
         editor: &mut Editor,
+        client_id: ClientId,
         items: Vec<CompletionItem>,
         trigger_offset: usize,
         size: Rect,
     ) -> Option<Rect> {
-        let mut completion = Completion::new(editor, items, trigger_offset);
+        let mut completion = Completion::new(editor, client_id, items, trigger_offset);
 
         if completion.is_empty() {
             // skip if we got no completion results
             return None;
         }
 
-        let area = completion.area(size, editor);
+        let area = completion.area(size, editor, client_id);
         editor.last_completion = Some(CompleteAction::Triggered);
         self.last_insert.1.push(InsertEvent::TriggerCompletion);
 
@@ -1020,7 +1040,11 @@ impl EditorView {
         Some(area)
     }
 
-    pub fn clear_completion(&mut self, editor: &mut Editor) -> Option<OnKeyCallback> {
+    pub fn clear_completion(
+        &mut self,
+        editor: &mut Editor,
+        client_id: ClientId,
+    ) -> Option<OnKeyCallback> {
         self.completion = None;
         let mut on_next_key: Option<OnKeyCallback> = None;
         editor.handlers.completions.request_controller.restart();
@@ -1039,7 +1063,7 @@ impl EditorView {
                     });
                     on_next_key = placeholder.then_some(Box::new(|cx, key| {
                         if let Some(c) = key.char() {
-                            let (view, doc) = current!(cx.editor);
+                            let (_client, view, doc) = current!(cx.editor, cx.client_id);
                             if let Some(snippet) = &doc.active_snippet {
                                 doc.apply(&snippet.delete_placeholder(doc.text()), view.id);
                             }
@@ -1048,7 +1072,7 @@ impl EditorView {
                     }))
                 }
                 CompleteAction::Selected { savepoint } => {
-                    let (view, doc) = current!(editor);
+                    let (_client, view, doc) = current!(editor, client_id);
                     doc.restore(view, &savepoint, false);
                 }
             }
@@ -1080,7 +1104,7 @@ impl EditorView {
         if let Some((on_next_key, _)) = self.on_next_key.take() {
             on_next_key(cxt, null_key_event);
         }
-        self.handle_keymap_event(cxt.editor.mode, cxt, null_key_event);
+        self.handle_keymap_event(client!(cxt.editor, cxt.client_id).mode, cxt, null_key_event);
         self.pseudo_pending.clear();
     }
 
@@ -1102,37 +1126,45 @@ impl EditorView {
             ..
         } = *event;
 
-        let pos_and_view = |editor: &Editor, row, column, ignore_virtual_text| {
-            editor.tree.views().find_map(|(view, _focus)| {
-                view.pos_at_screen_coords(
-                    &editor.documents[&view.doc],
-                    row,
-                    column,
-                    ignore_virtual_text,
-                )
-                .map(|pos| (pos, view.id))
-            })
-        };
+        let pos_and_view =
+            |editor: &Editor, client_id: ClientId, row, column, ignore_virtual_text| {
+                client!(editor, client_id)
+                    .tree
+                    .views(&editor.views)
+                    .find_map(|(view, _focus)| {
+                        view.pos_at_screen_coords(
+                            &editor.documents[&view.doc],
+                            row,
+                            column,
+                            ignore_virtual_text,
+                        )
+                        .map(|pos| (pos, view.id))
+                    })
+            };
 
-        let gutter_coords_and_view = |editor: &Editor, row, column| {
-            editor.tree.views().find_map(|(view, _focus)| {
-                view.gutter_coords_at_screen_coords(row, column)
-                    .map(|coords| (coords, view.id))
-            })
+        let gutter_coords_and_view = |editor: &Editor, client_id: ClientId, row, column| {
+            client!(editor, client_id)
+                .tree
+                .views(&editor.views)
+                .find_map(|(view, _focus)| {
+                    view.gutter_coords_at_screen_coords(row, column)
+                        .map(|coords| (coords, view.id))
+                })
         };
 
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let editor = &mut cxt.editor;
 
-                if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
-                    let prev_view_id = view!(editor).id;
-                    let doc = doc_mut!(editor, &view!(editor, view_id).doc);
+                if let Some((pos, view_id)) = pos_and_view(editor, cxt.client_id, row, column, true)
+                {
+                    let prev_view_id = client_view!(editor, cxt.client_id).id;
+                    let doc = doc_with_id_mut!(editor, &view!(editor, view_id).doc);
 
                     if modifiers == KeyModifiers::ALT {
                         let selection = doc.selection(view_id).clone();
                         doc.set_selection(view_id, selection.push(Range::point(pos)));
-                    } else if editor.mode == Mode::Select {
+                    } else if client!(editor, cxt.client_id).mode == Mode::Select {
                         // Discards non-primary selections for consistent UX with normal mode
                         let primary = doc.selection(view_id).primary().put_cursor(
                             doc.text().slice(..),
@@ -1146,7 +1178,7 @@ impl EditorView {
                     }
 
                     if view_id != prev_view_id {
-                        self.clear_completion(editor);
+                        self.clear_completion(editor, cxt.client_id);
                     }
 
                     editor.focus(view_id);
@@ -1155,10 +1187,12 @@ impl EditorView {
                     return EventResult::Consumed(None);
                 }
 
-                if let Some((coords, view_id)) = gutter_coords_and_view(editor, row, column) {
+                if let Some((coords, view_id)) =
+                    gutter_coords_and_view(editor, cxt.client_id, row, column)
+                {
                     editor.focus(view_id);
 
-                    let (view, doc) = current!(cxt.editor);
+                    let (_client, view, doc) = current!(cxt.editor, cxt.client_id);
 
                     let path = match doc.path() {
                         Some(path) => path.clone(),
@@ -1178,7 +1212,7 @@ impl EditorView {
             }
 
             MouseEventKind::Drag(MouseButton::Left) => {
-                let (view, doc) = current!(cxt.editor);
+                let (_client, view, doc) = current!(cxt.editor, cxt.client_id);
 
                 let pos = match view.pos_at_screen_coords(doc, row, column, true) {
                     Some(pos) => pos,
@@ -1195,7 +1229,7 @@ impl EditorView {
             }
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let current_view = cxt.editor.tree.focus;
+                let current_view = client!(cxt.editor, cxt.client_id).tree.focus;
 
                 let direction = match event.kind {
                     MouseEventKind::ScrollUp => Direction::Backward,
@@ -1203,15 +1237,17 @@ impl EditorView {
                     _ => unreachable!(),
                 };
 
-                match pos_and_view(cxt.editor, row, column, false) {
-                    Some((_, view_id)) => cxt.editor.tree.focus = view_id,
+                match pos_and_view(cxt.editor, cxt.client_id, row, column, false) {
+                    Some((_, view_id)) => {
+                        client_mut!(cxt.editor, cxt.client_id).tree.focus = view_id
+                    }
                     None => return EventResult::Ignored(None),
                 }
 
                 let offset = config.scroll_lines.unsigned_abs();
                 commands::scroll(cxt, offset, direction, false);
 
-                cxt.editor.tree.focus = current_view;
+                client_mut!(cxt.editor, cxt.client_id).tree.focus = current_view;
                 cxt.editor.ensure_cursor_in_view(current_view);
 
                 EventResult::Consumed(None)
@@ -1222,7 +1258,7 @@ impl EditorView {
                     return EventResult::Ignored(None);
                 }
 
-                let (view, doc) = current!(cxt.editor);
+                let (_client, view, doc) = current!(cxt.editor, cxt.client_id);
 
                 let should_yank = match cxt.editor.mouse_down_range.take() {
                     Some(down_range) => doc.selection(view.id).primary() != down_range,
@@ -1247,13 +1283,18 @@ impl EditorView {
             }
 
             MouseEventKind::Up(MouseButton::Right) => {
-                if let Some((pos, view_id)) = gutter_coords_and_view(cxt.editor, row, column) {
+                if let Some((pos, view_id)) =
+                    gutter_coords_and_view(cxt.editor, cxt.client_id, row, column)
+                {
                     cxt.editor.focus(view_id);
 
-                    if let Some((pos, _)) = pos_and_view(cxt.editor, row, column, true) {
-                        doc_mut!(cxt.editor).set_selection(view_id, Selection::point(pos));
+                    if let Some((pos, _)) =
+                        pos_and_view(cxt.editor, cxt.client_id, row, column, true)
+                    {
+                        doc_mut!(cxt.editor, cxt.client_id)
+                            .set_selection(view_id, Selection::point(pos));
                     } else {
-                        let (view, doc) = current!(cxt.editor);
+                        let (_client, view, doc) = current!(cxt.editor, cxt.client_id);
 
                         if let Some(pos) = view.pos_at_visual_coords(doc, pos.row as u16, 0, true) {
                             doc.set_selection(view_id, Selection::point(pos));
@@ -1285,8 +1326,9 @@ impl EditorView {
                     return EventResult::Consumed(None);
                 }
 
-                if let Some((pos, view_id)) = pos_and_view(editor, row, column, true) {
-                    let doc = doc_mut!(editor, &view!(editor, view_id).doc);
+                if let Some((pos, view_id)) = pos_and_view(editor, cxt.client_id, row, column, true)
+                {
+                    let doc = doc_with_id_mut!(editor, &view!(editor, view_id).doc);
                     doc.set_selection(view_id, Selection::point(pos));
                     cxt.editor.focus(view_id);
                     commands::MappableCommand::paste_primary_clipboard_before.execute(cxt);
@@ -1328,6 +1370,7 @@ impl Component for EditorView {
     ) -> EventResult {
         let mut cx = commands::Context {
             editor: context.editor,
+            client_id: context.client_id,
             count: None,
             register: None,
             callback: Vec::new(),
@@ -1338,13 +1381,13 @@ impl Component for EditorView {
         match event {
             Event::Paste(contents) => {
                 self.handle_non_key_input(&mut cx);
-                cx.count = cx.editor.count;
+                cx.count = client!(cx.editor, cx.client_id).count;
                 commands::paste_bracketed_value(&mut cx, contents.clone());
-                cx.editor.count = None;
+                client_mut!(cx.editor, cx.client_id).count = None;
 
                 let config = cx.editor.config();
-                let mode = cx.editor.mode();
-                let (view, doc) = current!(cx.editor);
+                let (client, view, doc) = current!(cx.editor, cx.client_id);
+                let mode = client.mode;
                 view.ensure_cursor_in_view(doc, config.scrolloff);
 
                 // Store a history state if not in insert mode. Otherwise wait till we exit insert
@@ -1367,7 +1410,7 @@ impl Component for EditorView {
                 // clear status
                 cx.editor.status_msg = None;
 
-                let mode = cx.editor.mode();
+                let mode = client!(cx.editor, cx.client_id).mode;
 
                 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
                     match mode {
@@ -1379,6 +1422,7 @@ impl Component for EditorView {
                                     // use a fake context here
                                     let mut cx = Context {
                                         editor: cx.editor,
+                                        client_id: cx.client_id,
                                         jobs: cx.jobs,
                                         scroll: None,
                                     };
@@ -1400,7 +1444,9 @@ impl Component for EditorView {
                                 if let Some(callback) = res {
                                     if callback.is_some() {
                                         // assume close_fn
-                                        if let Some(cb) = self.clear_completion(cx.editor) {
+                                        if let Some(cb) =
+                                            self.clear_completion(cx.editor, cx.client_id)
+                                        {
                                             if consumed {
                                                 cx.on_next_key_callback =
                                                     Some((cb, OnKeyCallbackKind::Fallback))
@@ -1436,13 +1482,13 @@ impl Component for EditorView {
 
                 // if the command consumed the last view, skip the render.
                 // on the next loop cycle the Application will then terminate.
-                if cx.editor.should_close() {
+                if cx.editor.should_close(cx.client_id) {
                     return EventResult::Ignored(None);
                 }
 
                 let config = cx.editor.config();
-                let mode = cx.editor.mode();
-                let (view, doc) = current!(cx.editor);
+                let (client, view, doc) = current!(cx.editor, cx.client_id);
+                let mode = client.mode;
 
                 view.ensure_cursor_in_view(doc, config.scrolloff);
 
@@ -1508,21 +1554,32 @@ impl Component for EditorView {
         }
 
         // if the terminal size suddenly changed, we need to trigger a resize
-        cx.editor.resize(editor_area);
+        cx.editor.resize(cx.client_id, editor_area);
 
         if use_bufferline {
-            Self::render_bufferline(cx.editor, area.with_height(1), surface);
+            Self::render_bufferline(cx.editor, cx.client_id, area.with_height(1), surface);
         }
 
-        for (view, is_focused) in cx.editor.tree.views() {
+        for (view, is_focused) in client!(cx.editor, cx.client_id)
+            .tree
+            .views(&cx.editor.views)
+        {
             let doc = cx.editor.document(view.doc).unwrap();
-            self.render_view(cx.editor, doc, view, area, surface, is_focused);
+            self.render_view(
+                cx.editor,
+                cx.client_id,
+                doc,
+                view,
+                area,
+                surface,
+                is_focused,
+            );
         }
 
         if config.auto_info {
-            if let Some(mut info) = cx.editor.autoinfo.take() {
+            if let Some(mut info) = client_mut!(cx.editor, cx.client_id).autoinfo.take() {
                 info.render(area, surface, cx);
-                cx.editor.autoinfo = Some(info)
+                client_mut!(cx.editor, cx.client_id).autoinfo = Some(info)
             }
         }
 
@@ -1549,7 +1606,7 @@ impl Component for EditorView {
 
         if area.width.saturating_sub(status_msg_width as u16) > key_width {
             let mut disp = String::new();
-            if let Some(count) = cx.editor.count {
+            if let Some(count) = client!(cx.editor, cx.client_id).count {
                 disp.push_str(&count.to_string())
             }
             for key in self.keymaps.pending() {
@@ -1590,8 +1647,13 @@ impl Component for EditorView {
         }
     }
 
-    fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        match editor.cursor() {
+    fn cursor(
+        &self,
+        _area: Rect,
+        editor: &Editor,
+        client_id: ClientId,
+    ) -> (Option<Position>, CursorKind) {
+        match editor.cursor(client_id) {
             // all block cursors are drawn manually
             (pos, CursorKind::Block) => {
                 if self.terminal_focused {

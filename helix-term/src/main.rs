@@ -1,9 +1,23 @@
 use anyhow::{Context, Error, Result};
-use crossterm::event::EventStream;
+use crossterm::terminal::{tty_file, winch_signal_receiver, Terminal};
 use helix_loader::VERSION_AND_GIT_HASH;
-use helix_term::application::Application;
+use helix_stdx::env::set_current_working_dir;
+use helix_stdx::socket::{read_fd, write_fd};
+use helix_term::application::{Application, ApplicationClient, ClientInfo};
 use helix_term::args::Args;
 use helix_term::config::{Config, ConfigLoadError};
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
+use tokio::{
+    net::{UnixListener, UnixSocket},
+    task::spawn_blocking,
+};
+use tokio_stream::StreamNotifyClose;
+use tokio_util::io::SyncIoBridge;
+use {signal_hook::consts::signal, signal_hook_tokio::Signals};
 
 fn setup_logging(verbosity: u64) -> Result<()> {
     let mut base_config = fern::Dispatch::new();
@@ -34,16 +48,7 @@ fn setup_logging(verbosity: u64) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let exit_code = main_impl()?;
-    std::process::exit(exit_code);
-}
-
-#[tokio::main]
-async fn main_impl() -> Result<i32> {
     let args = Args::parse_args().context("could not parse arguments")?;
-
-    helix_loader::initialize_config_file(args.config_file.clone());
-    helix_loader::initialize_log_file(args.log_file.clone());
 
     // Help has a higher priority and should be handled separately.
     if args.display_help {
@@ -91,6 +96,9 @@ FLAGS:
     }
 
     if args.health {
+        helix_loader::initialize_config_file(args.config_file.clone());
+        helix_loader::initialize_log_file(args.log_file.clone());
+
         if let Err(err) = helix_term::health::print_health(args.health_arg) {
             // Piping to for example `head -10` requires special handling:
             // https://stackoverflow.com/a/65760807/7115678
@@ -103,16 +111,124 @@ FLAGS:
     }
 
     if args.fetch_grammars {
+        helix_loader::initialize_config_file(args.config_file.clone());
+        helix_loader::initialize_log_file(args.log_file.clone());
         helix_loader::grammar::fetch_grammars()?;
-        return Ok(0);
+        std::process::exit(0);
     }
 
     if args.build_grammars {
+        helix_loader::initialize_config_file(args.config_file.clone());
+        helix_loader::initialize_log_file(args.log_file.clone());
         helix_loader::grammar::build_grammars(None)?;
-        return Ok(0);
+        std::process::exit(0);
     }
 
+    let client_info = ClientInfo::from_args(&args);
+
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or(std::env::temp_dir());
+    // Change directory to $XDG_RUNTIME_DIR. This has three purposes:
+    // 1) Flush out any unknown dependencies on the server's current directory.
+    // 2) Avoids issues associated with the server retaining a handle to the initial
+    //    client's current directory (e.g. failure to unmount filesystems).
+    // 3) Avoids filename length limits on the socket (UNIX_PATH_MAX in sockaddr_un).
+    set_current_working_dir(runtime_dir)?;
+
+    let socket_path = Path::new("helix");
+
+    if args.foreground_server {
+        let _ = std::fs::remove_file(&socket_path);
+        std::process::exit(server(args, &socket_path).unwrap());
+    }
+
+    let client_sock = UnixStream::connect(&socket_path);
+    let mut client_sock = client_sock.unwrap_or_else(|_e| {
+        // SAFETY: At this point we are running single threaded so fork() won't lead to deadlocks.
+        unsafe {
+            let _ = std::fs::remove_file(&socket_path);
+            let pid = libc::fork();
+            if pid == 0 {
+                use std::os::fd::AsRawFd;
+                libc::setsid();
+                {
+                    let devnull = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/null")
+                        .unwrap();
+                    libc::dup2(devnull.as_raw_fd(), libc::STDIN_FILENO);
+                    libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO);
+                    libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO);
+                }
+                std::process::exit(server(args, &socket_path).unwrap());
+            } else {
+                // We could have the server notify us when it's ready, but it's easiest to poll.
+                for _ in 0..50 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if let Ok(client_sock) = UnixStream::connect(&socket_path) {
+                        return client_sock;
+                    }
+                }
+                panic!("Server did not start");
+            }
+        }
+    });
+
+    rmp_serde::encode::write(&mut client_sock, &client_info)?;
+    write_fd(&client_sock, &tty_file()?)?;
+    if client_info.has_stdin {
+        write_fd(&client_sock, std::io::stdin())?;
+    }
+    client_sock.set_nonblocking(true)?;
+    std::process::exit(client(client_sock)?);
+}
+
+#[tokio::main]
+async fn client(socket: UnixStream) -> Result<i32> {
+    let mut socket = tokio::net::UnixStream::from_std(socket)?;
+    let mut signals = Signals::new([signal::SIGTSTP, signal::SIGCONT, signal::SIGWINCH])?;
+
+    use futures_util::StreamExt;
+
+    loop {
+        tokio::select! {
+            Some(signal) = signals.next() => {
+                socket.write_u8(signal as u8).await?;
+            }
+            _ = socket.readable() => {
+                let mut buf = [0];
+                match socket.try_read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        return Ok(buf[0] as i32);
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(0)
+}
+
+#[tokio::main]
+async fn server(args: Args, socket_path: &Path) -> Result<i32> {
+    helix_loader::initialize_config_file(args.config_file.clone());
+    helix_loader::initialize_log_file(args.log_file.clone());
+
     setup_logging(args.verbosity).context("failed to initialize logging")?;
+
+    let socket = UnixSocket::new_stream()?;
+    socket.bind(socket_path)?;
+    let listener = socket.listen(1024)?;
 
     // NOTE: Set the working directory early so the correct configuration is loaded. Be aware that
     // Application::new() depends on this logic so it must be updated if this changes.
@@ -148,9 +264,8 @@ FLAGS:
     });
 
     // TODO: use the thread local executor to spawn the application task separately from the work pool
-    let mut app = Application::new(args, config, lang_loader).context("unable to start Helix")?;
+    let mut app =
+        Application::new(config.clone(), lang_loader, listener).context("unable to start Helix")?;
 
-    let exit_code = app.run(&mut EventStream::new()).await?;
-
-    Ok(exit_code)
+    app.run().await
 }

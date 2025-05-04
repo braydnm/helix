@@ -4,6 +4,7 @@ use helix_core::command_line::{ExpansionKind, Token, TokenKind, Tokenizer};
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::ClientId;
 use crate::Editor;
 
 /// Variables that can be expanded in the command mode (`:`) via the expansion syntax.
@@ -87,7 +88,7 @@ impl Variable {
 ///
 /// Note that the lifetime of the expanded variable is only bound to the input token and not the
 /// `Editor`. See `expand_variable` below for more discussion of lifetimes.
-pub fn expand<'a>(editor: &Editor, token: Token<'a>) -> Result<Cow<'a, str>> {
+pub fn expand<'a>(editor: &Editor, client_id: ClientId, token: Token<'a>) -> Result<Cow<'a, str>> {
     // Note: see the `TokenKind` documentation for more details on how each branch should expand.
     match token.kind {
         TokenKind::Unquoted | TokenKind::Quoted(_) => Ok(token.content),
@@ -95,7 +96,7 @@ pub fn expand<'a>(editor: &Editor, token: Token<'a>) -> Result<Cow<'a, str>> {
             let var = Variable::from_name(&token.content)
                 .ok_or_else(|| anyhow!("unknown variable '{}'", token.content))?;
 
-            expand_variable(editor, var)
+            expand_variable(editor, client_id, var)
         }
         TokenKind::Expansion(ExpansionKind::Unicode) => {
             if let Some(ch) = u32::from_str_radix(token.content.as_ref(), 16)
@@ -110,8 +111,10 @@ pub fn expand<'a>(editor: &Editor, token: Token<'a>) -> Result<Cow<'a, str>> {
                 ))
             }
         }
-        TokenKind::Expand => expand_inner(editor, token.content),
-        TokenKind::Expansion(ExpansionKind::Shell) => expand_shell(editor, token.content),
+        TokenKind::Expand => expand_inner(editor, client_id, token.content),
+        TokenKind::Expansion(ExpansionKind::Shell) => {
+            expand_shell(editor, client_id, token.content)
+        }
         // Note: see the docs for this variant.
         TokenKind::ExpansionKind => unreachable!(
             "expansion name tokens cannot be emitted when command line validation is enabled"
@@ -120,11 +123,15 @@ pub fn expand<'a>(editor: &Editor, token: Token<'a>) -> Result<Cow<'a, str>> {
 }
 
 /// Expand a shell command.
-pub fn expand_shell<'a>(editor: &Editor, content: Cow<'a, str>) -> Result<Cow<'a, str>> {
+pub fn expand_shell<'a>(
+    editor: &Editor,
+    client_id: ClientId,
+    content: Cow<'a, str>,
+) -> Result<Cow<'a, str>> {
     use std::process::{Command, Stdio};
 
     // Recursively expand the expansion's content before executing the shell command.
-    let content = expand_inner(editor, content)?;
+    let content = expand_inner(editor, client_id, content)?;
 
     let config = editor.config();
     let shell = &config.shell;
@@ -168,7 +175,11 @@ pub fn expand_shell<'a>(editor: &Editor, content: Cow<'a, str>) -> Result<Cow<'a
 }
 
 /// Expand a token's contents recursively.
-fn expand_inner<'a>(editor: &Editor, content: Cow<'a, str>) -> Result<Cow<'a, str>> {
+fn expand_inner<'a>(
+    editor: &Editor,
+    client_id: ClientId,
+    content: Cow<'a, str>,
+) -> Result<Cow<'a, str>> {
     let mut escaped = String::new();
     let mut start = 0;
 
@@ -190,7 +201,7 @@ fn expand_inner<'a>(editor: &Editor, content: Cow<'a, str>) -> Result<Cow<'a, st
                 .unwrap()
                 .map_err(|err| anyhow!("{err}"))?;
             // expand it (this is the recursive part),
-            let expanded = expand(editor, token)?;
+            let expanded = expand(editor, client_id, token)?;
             escaped.push_str(expanded.as_ref());
             // and move forward to the end of the expansion.
             start = idx + tokenizer.pos();
@@ -211,8 +222,12 @@ fn expand_inner<'a>(editor: &Editor, content: Cow<'a, str>) -> Result<Cow<'a, st
 // function to return then, instead, would normally be a `String`. We can return some statically
 // known strings like the scratch buffer name or line ending strings though, so this function
 // returns a `Cow<'static, str>` instead.
-fn expand_variable(editor: &Editor, variable: Variable) -> Result<Cow<'static, str>> {
-    let (view, doc) = current_ref!(editor);
+fn expand_variable(
+    editor: &Editor,
+    client_id: ClientId,
+    variable: Variable,
+) -> Result<Cow<'static, str>> {
+    let (_client, view, doc) = current_ref!(editor, client_id);
     let text = doc.text().slice(..);
 
     match variable {
@@ -225,15 +240,9 @@ fn expand_variable(editor: &Editor, variable: Variable) -> Result<Cow<'static, s
             let position = helix_core::coords_at_pos(text, cursor);
             Ok(Cow::Owned((position.col + 1).to_string()))
         }
-        Variable::BufferName => {
-            // Note: usually we would use `Document::display_name` but we can statically borrow
-            // the scratch buffer name by partially reimplementing `display_name`.
-            if let Some(path) = doc.relative_path() {
-                Ok(Cow::Owned(path.to_string_lossy().into_owned()))
-            } else {
-                Ok(Cow::Borrowed(crate::document::SCRATCH_BUFFER_NAME))
-            }
-        }
+        Variable::BufferName => Ok(Cow::Owned(
+            doc.display_name(client!(editor, client_id).cwd.as_path()),
+        )),
         Variable::LineEnding => Ok(Cow::Borrowed(doc.line_ending.as_str())),
         Variable::Language => Ok(match doc.language_name() {
             Some(lang) => Cow::Owned(lang.to_owned()),

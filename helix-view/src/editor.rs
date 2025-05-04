@@ -11,8 +11,8 @@ use crate::{
     input::KeyEvent,
     register::Registers,
     theme::{self, Theme},
-    tree::{self, Tree},
-    Document, DocumentId, View, ViewId,
+    tree::{self, Content, Node, Tree},
+    ClientId, Document, DocumentId, View, ViewId,
 };
 use helix_event::dispatch;
 use helix_vcs::DiffProviderRegistry;
@@ -20,6 +20,7 @@ use helix_vcs::DiffProviderRegistry;
 use futures_util::stream::select_all::SelectAll;
 use futures_util::{future, StreamExt};
 use helix_lsp::{Call, LanguageServerId};
+use slotmap::HopSlotMap;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use std::{
@@ -29,6 +30,7 @@ use std::{
     fs,
     io::{self, stdin},
     num::{NonZeroU8, NonZeroUsize},
+    ops::DerefMut,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -1065,10 +1067,105 @@ use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
 
-pub struct Editor {
+pub struct EditorClient {
+    pub tree: Tree,
     /// Current editing mode.
     pub mode: Mode,
-    pub tree: Tree,
+    pub count: Option<std::num::NonZeroUsize>,
+    pub selected_register: Option<char>,
+    last_motion: Option<Motion>,
+    pub autoinfo: Option<Info>,
+    pub cwd: PathBuf,
+    last_cwd: Option<PathBuf>,
+    pub suspended: bool,
+    pub exit_code: i32,
+}
+
+#[derive(Debug)]
+pub struct ViewMap {
+    pub map: HopSlotMap<ViewId, Node>,
+}
+
+impl Default for ViewMap {
+    fn default() -> Self {
+        Self {
+            map: HopSlotMap::with_key(),
+        }
+    }
+}
+
+impl ViewMap {
+    /// Get reference to a [View] by index.
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes, or if the node's content is not [Content::View]. This can be checked with [Self::contains].
+    pub fn get(&self, index: ViewId) -> &View {
+        self.try_get(index).unwrap()
+    }
+
+    /// Get a mutable reference to a [View] by index.
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes, or if the node's content is not [Content::View]. This can be checked with [Self::contains].
+    pub fn get_mut(&mut self, index: ViewId) -> &mut View {
+        match &mut self.map[index] {
+            Node {
+                content: Content::View(view),
+                ..
+            } => view,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Try to get reference to a [View] by index. Returns `None` if node content is not a [`Content::View`].
+    ///
+    /// Does not panic if the view does not exists anymore.
+    pub fn try_get(&self, index: ViewId) -> Option<&View> {
+        match self.map.get(index) {
+            Some(Node {
+                content: Content::View(view),
+                ..
+            }) => Some(view),
+            _ => None,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &View> {
+        self.map.iter().filter_map(move |(_, node)| match node {
+            Node {
+                content: Content::View(view),
+                ..
+            } => Some(view.as_ref()),
+            _ => None,
+        })
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut View> {
+        self.map.iter_mut().filter_map(move |(_, node)| match node {
+            Node {
+                content: Content::View(view),
+                ..
+            } => Some(view.as_mut()),
+            _ => None,
+        })
+    }
+
+    pub fn view_root(&self, view_id: ViewId) -> ViewId {
+        let parent = self.map[view_id].parent;
+        if parent == view_id {
+            parent
+        } else {
+            self.view_root(parent)
+        }
+    }
+}
+
+pub struct Editor {
+    pub most_recent_client_id: Option<ClientId>,
+    pub clients: HopSlotMap<ClientId, EditorClient>,
+
+    pub views: ViewMap,
+
     pub next_document_id: DocumentId,
     pub documents: BTreeMap<DocumentId, Document>,
 
@@ -1078,8 +1175,6 @@ pub struct Editor {
     pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
     pub write_count: usize,
 
-    pub count: Option<std::num::NonZeroUsize>,
-    pub selected_register: Option<char>,
     pub registers: Registers,
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
@@ -1105,18 +1200,15 @@ pub struct Editor {
     pub last_selection: Option<Selection>,
 
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
-    pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
     pub auto_pairs: Option<AutoPairs>,
 
     pub idle_timer: Pin<Box<Sleep>>,
     redraw_timer: Pin<Box<Sleep>>,
-    last_motion: Option<Motion>,
     pub last_completion: Option<CompleteAction>,
-    last_cwd: Option<PathBuf>,
 
-    pub exit_code: i32,
+    pub exit_code: Option<i32>,
 
     pub config_events: (UnboundedSender<ConfigEvent>, UnboundedReceiver<ConfigEvent>),
     pub needs_redraw: bool,
@@ -1138,7 +1230,7 @@ pub struct Editor {
     pub cursor_cache: CursorCache,
 }
 
-pub type Motion = Box<dyn Fn(&mut Editor)>;
+pub type Motion = Box<dyn Fn(&mut Editor, ClientId)>;
 
 #[derive(Debug)]
 pub enum EditorEvent {
@@ -1196,14 +1288,13 @@ pub enum CloseError {
     /// Document doesn't exist
     DoesNotExist,
     /// Buffer is modified
-    BufferModified(String),
+    BufferModified,
     /// Document failed to save
     SaveError(anyhow::Error),
 }
 
 impl Editor {
     pub fn new(
-        mut area: Rect,
         theme_loader: Arc<theme::Loader>,
         syn_loader: Arc<ArcSwap<syntax::Loader>>,
         config: Arc<dyn DynAccess<Config>>,
@@ -1213,19 +1304,15 @@ impl Editor {
         let conf = config.load();
         let auto_pairs = (&conf.auto_pairs).into();
 
-        // HAXX: offset the render area height by 1 to account for prompt/commandline
-        area.height -= 1;
-
         Self {
-            mode: Mode::Normal,
-            tree: Tree::new(area),
+            clients: HopSlotMap::with_key(),
+            views: ViewMap::default(),
+            most_recent_client_id: None,
             next_document_id: DocumentId::default(),
             documents: BTreeMap::new(),
             saves: HashMap::new(),
             save_queue: SelectAll::new(),
             write_count: 0,
-            count: None,
-            selected_register: None,
             macro_recording: None,
             macro_replaying: Vec::new(),
             theme: theme_loader.default(),
@@ -1243,21 +1330,50 @@ impl Editor {
                 |config: &Config| &config.clipboard_provider,
             ))),
             status_msg: None,
-            autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
-            last_motion: None,
             last_completion: None,
-            last_cwd: None,
             config,
             auto_pairs,
-            exit_code: 0,
+            exit_code: None,
             config_events: unbounded_channel(),
             needs_redraw: false,
             handlers,
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
         }
+    }
+
+    pub fn add_client(&mut self, mut area: Rect, cwd: PathBuf) -> ClientId {
+        // HAXX: offset the render area height by 1 to account for prompt/commandline
+        area.height -= 1;
+
+        self.clients.insert(EditorClient {
+            tree: Tree::new(area, &mut self.views),
+            mode: Mode::Normal,
+            count: None,
+            selected_register: None,
+            last_motion: None,
+            autoinfo: None,
+            cwd,
+            last_cwd: None,
+            exit_code: 0,
+            suspended: false,
+        })
+    }
+
+    pub fn view_client_id(&self, id: ViewId) -> Option<ClientId> {
+        let view_root = self.views.view_root(id);
+        self.clients
+            .iter()
+            .filter_map(move |(id, c)| {
+                if c.tree.root == view_root {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .next()
     }
 
     pub fn popup_border(&self) -> bool {
@@ -1270,22 +1386,22 @@ impl Editor {
             || self.config().popup_border == PopupBorderConfig::Menu
     }
 
-    pub fn apply_motion<F: Fn(&mut Self) + 'static>(&mut self, motion: F) {
-        motion(self);
-        self.last_motion = Some(Box::new(motion));
+    pub fn apply_motion<F: Fn(&mut Self, ClientId) + 'static>(
+        &mut self,
+        client_id: ClientId,
+        motion: F,
+    ) {
+        motion(self, client_id);
+        client_mut!(self, client_id).last_motion = Some(Box::new(motion));
     }
 
-    pub fn repeat_last_motion(&mut self, count: usize) {
-        if let Some(motion) = self.last_motion.take() {
+    pub fn repeat_last_motion(&mut self, client_id: ClientId, count: usize) {
+        if let Some(motion) = client_mut!(self, client_id).last_motion.take() {
             for _ in 0..count {
-                motion(self);
+                motion(self, client_id);
             }
-            self.last_motion = Some(motion);
+            client_mut!(self, client_id).last_motion = Some(motion);
         }
-    }
-    /// Current editing mode for the [`Editor`].
-    pub fn mode(&self) -> Mode {
-        self.mode
     }
 
     pub fn config(&self) -> DynGuard<Config> {
@@ -1416,8 +1532,13 @@ impl Editor {
 
     /// moves/renames a path, invoking any event handlers (currently only lsp)
     /// and calling `set_doc_path` if the file is open in the editor
-    pub fn move_path(&mut self, old_path: &Path, new_path: &Path) -> io::Result<()> {
-        let new_path = canonicalize(new_path);
+    pub fn move_path(
+        &mut self,
+        client_id: ClientId,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> io::Result<()> {
+        let new_path = canonicalize(client!(self, client_id).cwd.clone(), new_path);
         // sanity check
         if old_path == new_path {
             return Ok(());
@@ -1440,7 +1561,9 @@ impl Editor {
                     continue;
                 }
             };
-            if let Err(err) = self.apply_workspace_edit(language_server.offset_encoding(), &edit) {
+            if let Err(err) =
+                self.apply_workspace_edit(client_id, language_server.offset_encoding(), &edit)
+            {
                 log::error!("failed to apply workspace edit: {err:?}")
             }
         }
@@ -1471,7 +1594,7 @@ impl Editor {
     }
 
     pub fn set_doc_path(&mut self, doc_id: DocumentId, path: &Path) {
-        let doc = doc_mut!(self, &doc_id);
+        let doc = doc_with_id_mut!(self, &doc_id);
         let old_path = doc.path();
 
         if let Some(old_path) = old_path {
@@ -1490,19 +1613,20 @@ impl Editor {
         // text_document_did_close. Since we called `text_document_did_close`
         // we have fully unregistered this document from its LS
         doc.language_servers.clear();
-        doc.set_path(Some(path));
+        let path = helix_stdx::path::canonicalize(helix_stdx::env::current_working_dir(), path);
+        doc.set_path(Some(path.as_path()));
         doc.detect_editor_config();
         self.refresh_doc_language(doc_id)
     }
 
     pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
         let loader = self.syn_loader.load();
-        let doc = doc_mut!(self, &doc_id);
+        let doc = doc_with_id_mut!(self, &doc_id);
         doc.detect_language(&loader);
         doc.detect_editor_config();
         doc.detect_indent_and_line_ending();
         self.refresh_language_servers(doc_id);
-        let doc = doc_mut!(self, &doc_id);
+        let doc = doc_with_id_mut!(self, &doc_id);
         let diagnostics = Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, doc);
         doc.replace_diagnostics(diagnostics, &[], None);
         doc.reset_all_inlay_hints();
@@ -1602,8 +1726,8 @@ impl Editor {
             }
         }
 
-        for (view, _) in self.tree.views_mut() {
-            let doc = doc_mut!(self, &view.doc);
+        for view in self.views.iter_mut() {
+            let doc = doc_with_id_mut!(self, &view.doc);
             view.sync_changes(doc);
             view.gutters = config.gutters.clone();
             view.ensure_cursor_in_view(doc, config.scrolloff)
@@ -1612,10 +1736,10 @@ impl Editor {
 
     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
         let scrolloff = self.config().scrolloff;
-        let view = self.tree.get_mut(current_view);
+        let view = view_mut!(self, current_view);
 
         view.doc = doc_id;
-        let doc = doc_mut!(self, &doc_id);
+        let doc = doc_with_id_mut!(self, &doc_id);
 
         doc.ensure_view_init(view.id);
         view.sync_changes(doc);
@@ -1624,7 +1748,7 @@ impl Editor {
         view.ensure_cursor_in_view(doc, scrolloff)
     }
 
-    pub fn switch(&mut self, id: DocumentId, action: Action) {
+    pub fn switch(&mut self, client_id: ClientId, id: DocumentId, action: Action) {
         use crate::tree::Layout;
 
         if !self.documents.contains_key(&id) {
@@ -1633,12 +1757,12 @@ impl Editor {
         }
 
         if !matches!(action, Action::Load) {
-            self.enter_normal_mode();
+            self.enter_normal_mode(client_id);
         }
 
         let focust_lost = match action {
             Action::Replace => {
-                let (view, doc) = current_ref!(self);
+                let (_client, view, doc) = current_ref!(self, client_id);
                 // If the current view is an empty scratch buffer and is not displayed in any other views, delete it.
                 // Boolean value is determined before the call to `view_mut` because the operation requires a borrow
                 // of `self.tree`, which is mutably borrowed when `view_mut` is called.
@@ -1648,12 +1772,10 @@ impl Editor {
                     // If the buffer we are changing to is not this buffer
                     && id != doc.id
                     // Ensure the buffer is not displayed in any other splits.
-                    && !self
-                        .tree
-                        .traverse()
-                        .any(|(_, v)| v.doc == doc.id && v.id != view.id);
+                    && !self.views.iter()
+                        .any(|v| v.doc == doc.id && v.id != view.id);
 
-                let (view, doc) = current!(self);
+                let (_client, view, doc) = current!(self, client_id);
                 let view_id = view.id;
 
                 // Append any outstanding changes to history in the old document.
@@ -1666,7 +1788,7 @@ impl Editor {
                     self.documents.remove(&id);
 
                     // Remove the scratch buffer from any jumplists
-                    for (view, _) in self.tree.views_mut() {
+                    for view in self.views.iter_mut() {
                         view.remove_document(&id);
                     }
                 } else {
@@ -1688,27 +1810,30 @@ impl Editor {
 
                 dispatch(DocumentFocusLost {
                     editor: self,
+                    client: client_id,
                     doc: id,
                 });
                 return;
             }
             Action::Load => {
-                let view_id = view!(self).id;
-                let doc = doc_mut!(self, &id);
+                let view_id = client_view!(self, client_id).id;
+                let doc = doc_with_id_mut!(self, &id);
                 doc.ensure_view_init(view_id);
                 doc.mark_as_focused();
                 return;
             }
             Action::HorizontalSplit | Action::VerticalSplit => {
-                let focus_lost = self.tree.try_get(self.tree.focus).map(|view| view.doc);
+                let client = client!(self, client_id);
+                let focus_lost = self.views.try_get(client.tree.focus).map(|view| view.doc);
                 // copy the current view, unless there is no view yet
                 let view = self
-                    .tree
-                    .try_get(self.tree.focus)
+                    .views
+                    .try_get(client.tree.focus)
                     .filter(|v| id == v.doc) // Different Document
                     .cloned()
                     .unwrap_or_else(|| View::new(id, self.config().gutters.clone()));
-                let view_id = self.tree.split(
+                let view_id = client_mut!(self, client_id).tree.split(
+                    &mut self.views,
                     view,
                     match action {
                         Action::HorizontalSplit => Layout::Horizontal,
@@ -1717,7 +1842,7 @@ impl Editor {
                     },
                 );
                 // initialize selection for view
-                let doc = doc_mut!(self, &id);
+                let doc = doc_with_id_mut!(self, &id);
                 doc.ensure_view_init(view_id);
                 doc.mark_as_focused();
                 focus_lost
@@ -1728,6 +1853,7 @@ impl Editor {
         if let Some(focus_lost) = focust_lost {
             dispatch(DocumentFocusLost {
                 editor: self,
+                client: client_id,
                 doc: focus_lost,
             });
         }
@@ -1751,30 +1877,41 @@ impl Editor {
         id
     }
 
-    fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
+    fn new_file_from_document(
+        &mut self,
+        client_id: ClientId,
+        action: Action,
+        doc: Document,
+    ) -> DocumentId {
         let id = self.new_document(doc);
-        self.switch(id, action);
+        self.switch(client_id, id, action);
         id
     }
 
-    pub fn new_file(&mut self, action: Action) -> DocumentId {
+    pub fn new_file(&mut self, client_id: ClientId, action: Action) -> DocumentId {
         self.new_file_from_document(
+            client_id,
             action,
             Document::default(self.config.clone(), self.syn_loader.clone()),
         )
     }
 
-    pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
-        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+    pub fn new_file_from_reader<R: std::io::Read + ?Sized>(
+        &mut self,
+        client_id: ClientId,
+        action: Action,
+        reader: &mut R,
+    ) -> Result<DocumentId, Error> {
+        let (stdin, encoding, has_bom) = crate::document::read_to_string(reader, None)?;
         let doc = Document::from(
             helix_core::Rope::default(),
             Some((encoding, has_bom)),
             self.config.clone(),
             self.syn_loader.clone(),
         );
-        let doc_id = self.new_file_from_document(action, doc);
-        let doc = doc_mut!(self, &doc_id);
-        let view = view_mut!(self);
+        let doc_id = self.new_file_from_document(client_id, action, doc);
+        let doc = doc_with_id_mut!(self, &doc_id);
+        let view = client_view_mut!(self, client_id);
         doc.ensure_view_init(view.id);
         let transaction =
             helix_core::Transaction::insert(doc.text(), doc.selection(view.id), stdin.into())
@@ -1789,8 +1926,13 @@ impl Editor {
     }
 
     // ??? possible use for integration tests
-    pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
-        let path = helix_stdx::path::canonicalize(path);
+    pub fn open(
+        &mut self,
+        client_id: ClientId,
+        path: &Path,
+        action: Action,
+    ) -> Result<DocumentId, DocumentOpenError> {
+        let path = helix_stdx::path::canonicalize(client!(self, client_id).cwd.clone(), path);
         let id = self.document_id_by_path(&path);
 
         let id = if let Some(id) = id {
@@ -1824,27 +1966,45 @@ impl Editor {
             id
         };
 
-        self.switch(id, action);
+        self.switch(client_id, id, action);
 
         Ok(id)
     }
 
     pub fn close(&mut self, id: ViewId) {
+        let previous_doc = view!(self, id).doc;
+
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
             doc.remove_view(id);
         }
-        self.tree.remove(id);
+        client_mut!(self, self.view_client_id(id).unwrap())
+            .tree
+            .remove(&mut self.views, id);
         self._refresh();
+
+        // If the buffer we just closed is unmodified and isn't open in another view,
+        // there's no good reason to remember it. This reduces the chance of problems
+        // with commands such as `git commit`.
+        if !doc_with_id!(self, &previous_doc).is_modified()
+            && self.views.iter().all(|view| view.doc != previous_doc)
+        {
+            let _ = self.close_document(previous_doc, false, false);
+        }
     }
 
-    pub fn close_document(&mut self, doc_id: DocumentId, force: bool) -> Result<(), CloseError> {
+    pub fn close_document(
+        &mut self,
+        doc_id: DocumentId,
+        force: bool,
+        ensure_view: bool,
+    ) -> Result<(), CloseError> {
         let doc = match self.documents.get(&doc_id) {
             Some(doc) => doc,
             None => return Err(CloseError::DoesNotExist),
         };
         if !force && doc.is_modified() {
-            return Err(CloseError::BufferModified(doc.display_name().into_owned()));
+            return Err(CloseError::BufferModified);
         }
 
         // This will also disallow any follow-up writes
@@ -1856,9 +2016,9 @@ impl Editor {
         }
 
         let actions: Vec<Action> = self
-            .tree
-            .views_mut()
-            .filter_map(|(view, _focus)| {
+            .views
+            .iter_mut()
+            .filter_map(|view| {
                 view.remove_document(&doc_id);
 
                 if view.doc == doc_id {
@@ -1888,26 +2048,36 @@ impl Editor {
 
         let doc = self.documents.remove(&doc_id).unwrap();
 
-        // If the document we removed was visible in all views, we will have no more views. We don't
-        // want to close the editor just for a simple buffer close, so we need to create a new view
-        // containing either an existing document, or a brand new document.
-        if self.tree.views().next().is_none() {
-            let doc_id = self
-                .documents
+        if ensure_view {
+            // If the document we removed was visible in all views, we will have no more views. We don't
+            // want to close the editor just for a simple buffer close, so we need to create a new view
+            // containing either an existing document, or a brand new document.
+            let empty_clients: Vec<ClientId> = self
+                .clients
                 .iter()
-                .map(|(&doc_id, _)| doc_id)
-                .next()
-                .unwrap_or_else(|| {
-                    self.new_document(Document::default(
-                        self.config.clone(),
-                        self.syn_loader.clone(),
-                    ))
-                });
-            let view = View::new(doc_id, self.config().gutters.clone());
-            let view_id = self.tree.insert(view);
-            let doc = doc_mut!(self, &doc_id);
-            doc.ensure_view_init(view_id);
-            doc.mark_as_focused();
+                .filter_map(|(id, client)| {
+                    if client.tree.views(&self.views).next().is_none() {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for client_id in empty_clients {
+                let doc_id = self
+                    .documents
+                    .iter()
+                    .map(|(&doc_id, _)| doc_id)
+                    .next()
+                    .unwrap_or_else(|| self.new_document(Document::default(self.config.clone(), self.syn_loader.clone())));
+                let view = View::new(doc_id, self.config().gutters.clone());
+                let view_id = client_mut!(self, client_id)
+                    .tree
+                    .insert(&mut self.views, view);
+                let doc = doc_with_id_mut!(self, &doc_id);
+                doc.ensure_view_init(view_id);
+                doc.mark_as_focused();
+            }
         }
 
         self._refresh();
@@ -1927,7 +2097,7 @@ impl Editor {
         // via stream.then() ? then push into main future
 
         let path = path.map(|path| path.into());
-        let doc = doc_mut!(self, &doc_id);
+        let doc = doc_with_id_mut!(self, &doc_id);
         let doc_save_future = doc.save(path, force)?;
 
         // When a file is written to, notify the file event handler.
@@ -1954,68 +2124,80 @@ impl Editor {
         Ok(())
     }
 
-    pub fn resize(&mut self, area: Rect) {
-        if self.tree.resize(area) {
+    pub fn resize(&mut self, client_id: ClientId, area: Rect) {
+        if client_mut!(self, client_id)
+            .tree
+            .resize(&mut self.views, area)
+        {
             self._refresh();
         };
     }
 
     pub fn focus(&mut self, view_id: ViewId) {
-        let prev_id = std::mem::replace(&mut self.tree.focus, view_id);
+        let client_id = self.view_client_id(view_id).unwrap();
+        let client = client_mut!(self, client_id);
+        let prev_id = std::mem::replace(&mut client.tree.focus, view_id);
 
         // if leaving the view: mode should reset and the cursor should be
         // within view
         if prev_id != view_id {
-            self.enter_normal_mode();
+            self.enter_normal_mode(client_id);
             self.ensure_cursor_in_view(view_id);
 
             // Update jumplist selections with new document changes.
-            for (view, _focused) in self.tree.views_mut() {
-                let doc = doc_mut!(self, &view.doc);
+            for view in self.views.iter_mut() {
+                let doc = doc_with_id_mut!(self, &view.doc);
                 view.sync_changes(doc);
             }
             let view = view!(self, view_id);
-            let doc = doc_mut!(self, &view.doc);
+            let doc = doc_with_id_mut!(self, &view.doc);
             doc.mark_as_focused();
-            let focus_lost = self.tree.get(prev_id).doc;
+            let focus_lost = self.views.get(prev_id).doc;
             dispatch(DocumentFocusLost {
                 editor: self,
+                client: client_id,
                 doc: focus_lost,
             });
         }
     }
 
-    pub fn focus_next(&mut self) {
-        self.focus(self.tree.next());
+    pub fn focus_next(&mut self, client_id: ClientId) {
+        self.focus(client!(self, client_id).tree.next(&self.views));
     }
 
-    pub fn focus_prev(&mut self) {
-        self.focus(self.tree.prev());
+    pub fn focus_prev(&mut self, client_id: ClientId) {
+        self.focus(client!(self, client_id).tree.prev(&self.views));
     }
 
-    pub fn focus_direction(&mut self, direction: tree::Direction) {
-        let current_view = self.tree.focus;
-        if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
+    pub fn focus_direction(&mut self, client_id: ClientId, direction: tree::Direction) {
+        let current_view = client!(self, client_id).tree.focus;
+        if let Some(id) = client!(self, client_id).tree.find_split_in_direction(
+            &self.views,
+            current_view,
+            direction,
+        ) {
             self.focus(id)
         }
     }
 
-    pub fn swap_split_in_direction(&mut self, direction: tree::Direction) {
-        self.tree.swap_split_in_direction(direction);
+    pub fn swap_split_in_direction(&mut self, client_id: ClientId, direction: tree::Direction) {
+        client_mut!(self, client_id)
+            .tree
+            .swap_split_in_direction(&mut self.views, direction);
     }
 
-    pub fn transpose_view(&mut self) {
-        self.tree.transpose();
+    pub fn transpose_view(&mut self, client_id: ClientId) {
+        client_mut!(self, client_id).tree.transpose(&mut self.views);
     }
 
-    pub fn should_close(&self) -> bool {
-        self.tree.is_empty()
+    pub fn should_close(&self, client_id: ClientId) -> bool {
+        client!(self, client_id).tree.is_empty(&self.views)
     }
 
     pub fn ensure_cursor_in_view(&mut self, id: ViewId) {
         let config = self.config();
-        let view = self.tree.get(id);
-        let doc = doc_mut!(self, &view.doc);
+        let view = self.views.get(id);
+        let doc = doc_with_id_mut!(self, &view.doc);
         view.ensure_cursor_in_view(doc, config.scrolloff)
     }
 
@@ -2104,14 +2286,14 @@ impl Editor {
 
     /// Gets the primary cursor position in screen coordinates,
     /// or `None` if the primary cursor is not visible on screen.
-    pub fn cursor(&self) -> (Option<Position>, CursorKind) {
+    pub fn cursor(&self, client_id: ClientId) -> (Option<Position>, CursorKind) {
         let config = self.config();
-        let (view, doc) = current_ref!(self);
+        let (_client, view, doc) = current_ref!(self, client_id);
         if let Some(mut pos) = self.cursor_cache.get(view, doc) {
             let inner = view.inner_area(doc);
             pos.col += inner.x as usize;
             pos.row += inner.y as usize;
-            let cursorkind = config.cursor_shape.from_mode(self.mode);
+            let cursorkind = config.cursor_shape.from_mode(client!(self, client_id).mode);
             (Some(pos), cursorkind)
         } else {
             (None, CursorKind::default())
@@ -2199,7 +2381,7 @@ impl Editor {
                     }
                 };
 
-                let doc = doc_mut!(self, &save_event.doc_id);
+                let doc = doc_with_id_mut!(self, &save_event.doc_id);
                 doc.set_last_saved_revision(save_event.revision, save_event.save_time);
             }
         }
@@ -2208,15 +2390,15 @@ impl Editor {
     }
 
     /// Switches the editor into normal mode.
-    pub fn enter_normal_mode(&mut self) {
+    pub fn enter_normal_mode(&mut self, client_id: ClientId) {
         use helix_core::graphemes;
 
-        if self.mode == Mode::Normal {
+        if client!(self, client_id).mode == Mode::Normal {
             return;
         }
 
-        self.mode = Mode::Normal;
-        let (view, doc) = current!(self);
+        let (client, view, doc) = current!(self, client_id);
+        client.mode = Mode::Normal;
 
         try_restore_indent(doc, view);
 
@@ -2245,8 +2427,8 @@ impl Editor {
     /// making sure it is synced with the current changes
     /// if possible or there are no selections returns current_view
     /// otherwise uses an arbitrary view
-    pub fn get_synced_view_id(&mut self, id: DocumentId) -> ViewId {
-        let current_view = view_mut!(self);
+    pub fn get_synced_view_id(&mut self, client_id: ClientId, id: DocumentId) -> ViewId {
+        let current_view = client_view_mut!(self, client_id);
         let doc = self.documents.get_mut(&id).unwrap();
         if doc.selections().contains_key(&current_view.id) {
             // only need to sync current view if this is not the current doc
@@ -2256,7 +2438,7 @@ impl Editor {
             current_view.id
         } else if let Some(view_id) = doc.selections().keys().next() {
             let view_id = *view_id;
-            let view = self.tree.get_mut(view_id);
+            let view = self.views.get_mut(view_id);
             view.sync_changes(doc);
             view_id
         } else {
@@ -2265,14 +2447,19 @@ impl Editor {
         }
     }
 
-    pub fn set_cwd(&mut self, path: &Path) -> std::io::Result<()> {
-        self.last_cwd = helix_stdx::env::set_current_working_dir(path)?;
-        self.clear_doc_relative_paths();
+    pub fn set_cwd(&mut self, client_id: ClientId, path: &Path) -> std::io::Result<()> {
+        let client = client_mut!(self, client_id);
+        client.last_cwd = Some(client.cwd.clone());
+        client.cwd = path.to_path_buf();
         Ok(())
     }
 
-    pub fn get_last_cwd(&mut self) -> Option<&Path> {
-        self.last_cwd.as_deref()
+    pub fn get_last_cwd(&mut self, client_id: ClientId) -> Option<&Path> {
+        client_mut!(self, client_id).last_cwd.as_deref()
+    }
+
+    pub fn get_cwd(&mut self, client_id: ClientId) -> &Path {
+        client_mut!(self, client_id).cwd.deref_mut()
     }
 }
 
