@@ -1322,12 +1322,12 @@ fn goto_file_vsplit(cx: &mut Context) {
 
 /// Goto files in selection.
 fn goto_file_impl(cx: &mut Context, action: Action) {
-    let (_client, view, doc) = current_ref!(cx.editor, cx.client_id);
+    let (client, view, doc) = current_ref!(cx.editor, cx.client_id);
     let text = doc.text().slice(..);
     let selections = doc.selection(view.id);
     let primary = selections.primary();
     let rel_path = doc
-        .relative_path()
+        .relative_path(client.cwd.as_path())
         .map(|path| path.parent().unwrap().to_path_buf())
         .unwrap_or_default();
 
@@ -1381,9 +1381,9 @@ fn goto_file_impl(cx: &mut Context, action: Action) {
 /// Opens the given url. If the URL points to a valid textual file it is open in helix.
 //  Otherwise, the file is open using external program.
 fn open_url(cx: &mut Context, url: Url, action: Action) {
-    let doc = doc!(cx.editor, cx.client_id);
+    let (client, _view, doc) = current!(cx.editor, cx.client_id);
     let rel_path = doc
-        .relative_path()
+        .relative_path(client.cwd.as_path())
         .map(|path| path.parent().unwrap().to_path_buf())
         .unwrap_or_default();
 
@@ -2478,6 +2478,7 @@ fn global_search(cx: &mut Context) {
     }
 
     struct GlobalSearchConfig {
+        cwd: PathBuf,
         smart_case: bool,
         file_picker_config: helix_view::editor::FilePickerConfig,
         directory_style: Style,
@@ -2487,6 +2488,7 @@ fn global_search(cx: &mut Context) {
 
     let config = cx.editor.config();
     let config = GlobalSearchConfig {
+        cwd: client_mut!(cx.editor, cx.client_id).cwd.clone(),
         smart_case: config.search.smart_case,
         file_picker_config: config.file_picker.clone(),
         directory_style: cx.editor.theme.get("ui.text.directory"),
@@ -2496,7 +2498,7 @@ fn global_search(cx: &mut Context) {
 
     let columns = [
         PickerColumn::new("path", |item: &FileResult, config: &GlobalSearchConfig| {
-            let path = helix_stdx::path::get_relative_path(&item.path);
+            let path = helix_stdx::path::get_relative_path(&config.cwd, &item.path);
 
             let directories = path
                 .parent()
@@ -2522,14 +2524,14 @@ fn global_search(cx: &mut Context) {
 
     let get_files = |query: &str,
                      editor: &mut Editor,
-                     _client_id: ClientId,
+                     client_id: ClientId,
                      config: std::sync::Arc<GlobalSearchConfig>,
                      injector: &ui::picker::Injector<_, _>| {
         if query.is_empty() {
             return async { Ok(()) }.boxed();
         }
 
-        let search_root = helix_stdx::env::current_working_dir();
+        let search_root = client!(editor, client_id).cwd.clone();
         if !search_root.exists() {
             return async { Err(anyhow::anyhow!("Current working directory does not exist")) }
                 .boxed();
@@ -3071,7 +3073,7 @@ fn append_mode(cx: &mut Context) {
 }
 
 fn file_picker(cx: &mut Context) {
-    let root = find_workspace().0;
+    let root = find_workspace(client!(cx.editor, cx.client_id).cwd.as_path()).0;
     if !root.exists() {
         cx.editor.set_error("Workspace directory does not exist");
         return;
@@ -3098,7 +3100,7 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
 }
 
 fn file_picker_in_current_directory(cx: &mut Context) {
-    let cwd = helix_stdx::env::current_working_dir();
+    let cwd = client_mut!(cx.editor, cx.client_id).cwd.clone();
     if !cwd.exists() {
         cx.editor
             .set_error("Current working directory does not exist");
@@ -3109,7 +3111,7 @@ fn file_picker_in_current_directory(cx: &mut Context) {
 }
 
 fn file_explorer(cx: &mut Context) {
-    let root = find_workspace().0;
+    let root = find_workspace(client!(cx.editor, cx.client_id).cwd.as_path()).0;
     if !root.exists() {
         cx.editor.set_error("Workspace directory does not exist");
         return;
@@ -3128,7 +3130,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
     let path = match doc_dir {
         Some(path) => path,
         None => {
-            let cwd = helix_stdx::env::current_working_dir();
+            let cwd = client_mut!(cx.editor, cx.client_id).cwd.clone();
             if !cwd.exists() {
                 cx.editor.set_error(
                     "Current buffer has no parent and current working directory does not exist",
@@ -3148,7 +3150,7 @@ fn file_explorer_in_current_buffer_directory(cx: &mut Context) {
 }
 
 fn file_explorer_in_current_directory(cx: &mut Context) {
-    let cwd = helix_stdx::env::current_working_dir();
+    let cwd = client_mut!(cx.editor, cx.client_id).cwd.clone();
     if !cwd.exists() {
         cx.editor
             .set_error("Current working directory does not exist");
@@ -3201,11 +3203,11 @@ fn buffer_picker(cx: &mut Context) {
             }
             flags.into()
         }),
-        PickerColumn::new("path", |meta: &BufferMeta, _| {
+        PickerColumn::new("path", |meta: &BufferMeta, cwd: &PathBuf| {
             let path = meta
                 .path
                 .as_deref()
-                .map(helix_stdx::path::get_relative_path);
+                .map(|path| helix_stdx::path::get_relative_path(cwd, path));
             path.as_deref()
                 .and_then(Path::to_str)
                 .unwrap_or(SCRATCH_BUFFER_NAME)
@@ -3213,9 +3215,16 @@ fn buffer_picker(cx: &mut Context) {
                 .into()
         }),
     ];
-    let picker = Picker::new(cx.client_id, columns, 2, items, (), |cx, meta, action| {
-        cx.editor.switch(cx.client_id, meta.id, action);
-    })
+    let picker = Picker::new(
+        cx.client_id,
+        columns,
+        2,
+        items,
+        client_mut!(cx.editor, cx.client_id).cwd.clone(),
+        |cx, meta, action| {
+            cx.editor.switch(cx.client_id, meta.id, action);
+        },
+    )
     .with_preview(|editor, meta| {
         let doc = &editor.documents.get(&meta.id)?;
         let lines = doc.selections().values().next().map(|selection| {
@@ -3264,11 +3273,11 @@ fn jumplist_picker(cx: &mut Context) {
 
     let columns = [
         ui::PickerColumn::new("id", |item: &JumpMeta, _| item.id.to_string().into()),
-        ui::PickerColumn::new("path", |item: &JumpMeta, _| {
+        ui::PickerColumn::new("path", |item: &JumpMeta, cwd: &PathBuf| {
             let path = item
                 .path
                 .as_deref()
-                .map(helix_stdx::path::get_relative_path);
+                .map(|path| helix_stdx::path::get_relative_path(cwd, path));
             path.as_deref()
                 .and_then(Path::to_str)
                 .unwrap_or(SCRATCH_BUFFER_NAME)
@@ -3303,7 +3312,7 @@ fn jumplist_picker(cx: &mut Context) {
                     .rev()
                     .map(|(doc_id, selection)| new_meta(view, *doc_id, selection.clone()))
             }),
-        (),
+        client!(cx.editor, cx.client_id).cwd.clone(),
         |cx, meta, action| {
             cx.editor.switch(cx.client_id, meta.id, action);
             let config = cx.editor.config();
@@ -3335,7 +3344,7 @@ fn changed_file_picker(cx: &mut Context) {
         style_renamed: Style,
     }
 
-    let cwd = helix_stdx::env::current_working_dir();
+    let cwd = client_mut!(cx.editor, cx.client_id).cwd.clone();
     if !cwd.exists() {
         cx.editor
             .set_error("Current working directory does not exist");
@@ -3647,7 +3656,7 @@ async fn make_format_callback(
                     editor.set_error(err.to_string());
                     return;
                 }
-                log::info!("failed to format '{}': {err}", doc.display_name());
+                log::info!("failed to format '{:?}': {err}", doc.path());
             }
         }
 

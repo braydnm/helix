@@ -30,6 +30,7 @@ use std::{
     fs,
     io::{self, stdin},
     num::{NonZeroU8, NonZeroUsize},
+    ops::DerefMut,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -1069,6 +1070,8 @@ pub struct EditorClient {
     pub selected_register: Option<char>,
     last_motion: Option<Motion>,
     pub autoinfo: Option<Info>,
+    pub cwd: PathBuf,
+    last_cwd: Option<PathBuf>,
     pub suspended: bool,
 }
 
@@ -1198,7 +1201,6 @@ pub struct Editor {
     pub idle_timer: Pin<Box<Sleep>>,
     redraw_timer: Pin<Box<Sleep>>,
     pub last_completion: Option<CompleteAction>,
-    last_cwd: Option<PathBuf>,
 
     pub exit_code: i32,
 
@@ -1280,7 +1282,7 @@ pub enum CloseError {
     /// Document doesn't exist
     DoesNotExist,
     /// Buffer is modified
-    BufferModified(String),
+    BufferModified,
     /// Document failed to save
     SaveError(anyhow::Error),
 }
@@ -1325,7 +1327,6 @@ impl Editor {
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
             last_completion: None,
-            last_cwd: None,
             config,
             auto_pairs,
             exit_code: 0,
@@ -1337,7 +1338,7 @@ impl Editor {
         }
     }
 
-    pub fn add_client(&mut self, mut area: Rect) -> ClientId {
+    pub fn add_client(&mut self, mut area: Rect, cwd: PathBuf) -> ClientId {
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
 
@@ -1348,6 +1349,8 @@ impl Editor {
             selected_register: None,
             last_motion: None,
             autoinfo: None,
+            cwd,
+            last_cwd: None,
             suspended: false,
         })
     }
@@ -1528,7 +1531,7 @@ impl Editor {
         old_path: &Path,
         new_path: &Path,
     ) -> io::Result<()> {
-        let new_path = canonicalize(new_path);
+        let new_path = canonicalize(client!(self, client_id).cwd.clone(), new_path);
         // sanity check
         if old_path == new_path {
             return Ok(());
@@ -1603,7 +1606,8 @@ impl Editor {
         // text_document_did_close. Since we called `text_document_did_close`
         // we have fully unregistered this document from its LS
         doc.language_servers.clear();
-        doc.set_path(Some(path));
+        let path = helix_stdx::path::canonicalize(helix_stdx::env::current_working_dir(), path);
+        doc.set_path(Some(path.as_path()));
         doc.detect_editor_config();
         self.refresh_doc_language(doc_id)
     }
@@ -1920,7 +1924,7 @@ impl Editor {
         path: &Path,
         action: Action,
     ) -> Result<DocumentId, DocumentOpenError> {
-        let path = helix_stdx::path::canonicalize(path);
+        let path = helix_stdx::path::canonicalize(client!(self, client_id).cwd.clone(), path);
         let id = self.document_id_by_path(&path);
 
         let id = if let Some(id) = id {
@@ -1976,7 +1980,7 @@ impl Editor {
             None => return Err(CloseError::DoesNotExist),
         };
         if !force && doc.is_modified() {
-            return Err(CloseError::BufferModified(doc.display_name().into_owned()));
+            return Err(CloseError::BufferModified);
         }
 
         // This will also disallow any follow-up writes
@@ -2422,14 +2426,19 @@ impl Editor {
         }
     }
 
-    pub fn set_cwd(&mut self, path: &Path) -> std::io::Result<()> {
-        self.last_cwd = helix_stdx::env::set_current_working_dir(path)?;
-        self.clear_doc_relative_paths();
+    pub fn set_cwd(&mut self, client_id: ClientId, path: &Path) -> std::io::Result<()> {
+        let client = client_mut!(self, client_id);
+        client.last_cwd = Some(client.cwd.clone());
+        client.cwd = path.to_path_buf();
         Ok(())
     }
 
-    pub fn get_last_cwd(&mut self) -> Option<&Path> {
-        self.last_cwd.as_deref()
+    pub fn get_last_cwd(&mut self, client_id: ClientId) -> Option<&Path> {
+        client_mut!(self, client_id).last_cwd.as_deref()
+    }
+
+    pub fn get_cwd(&mut self, client_id: ClientId) -> &Path {
+        client_mut!(self, client_id).cwd.deref_mut()
     }
 }
 
