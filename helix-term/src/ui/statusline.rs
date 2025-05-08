@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use helix_core::indent::IndentStyle;
 use helix_core::{coords_at_pos, encoding, Position};
 use helix_lsp::lsp::DiagnosticSeverity;
+use helix_stdx::path::get_relative_path;
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::{
     document::{Mode, SCRATCH_BUFFER_NAME},
@@ -454,7 +455,9 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     let title = {
-        let rel_path = context.doc.relative_path();
+        let rel_path = context
+            .doc
+            .relative_path(client!(context.editor, context.client_id).cwd.as_path());
         let path = rel_path
             .as_ref()
             .map(|p| p.to_string_lossy())
@@ -511,7 +514,9 @@ where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
     let title = {
-        let rel_path = context.doc.relative_path();
+        let rel_path = context
+            .doc
+            .relative_path(client!(context.editor, context.client_id).cwd.as_path());
         let path = rel_path
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy()))
