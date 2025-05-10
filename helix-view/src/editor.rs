@@ -1889,12 +1889,13 @@ impl Editor {
         )
     }
 
-    pub fn new_file_from_stdin(
+    pub fn new_file_from_reader<R: std::io::Read + ?Sized>(
         &mut self,
         client_id: ClientId,
         action: Action,
+        reader: &mut R,
     ) -> Result<DocumentId, Error> {
-        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+        let (stdin, encoding, has_bom) = crate::document::read_to_string(reader, None)?;
         let doc = Document::from(
             helix_core::Rope::default(),
             Some((encoding, has_bom)),
