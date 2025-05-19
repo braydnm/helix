@@ -1028,12 +1028,11 @@ pub fn goto_reference(cx: &mut Context) {
 }
 
 pub fn switch_source_header(cx: &mut Context) {
-    let (_client, _, doc) = current!(cx.editor, cx.client_id);
+    let (_, doc) = current!(cx.editor);
     let language_server =
         language_server_with_feature!(cx.editor, doc, LanguageServerFeature::Diagnostics);
 
     let future = language_server.switch_source_header(doc.identifier()).unwrap();
-    let client_id = cx.client_id.clone();
 
     cx.callback(future, move |editor, _, response: Option<lsp::Url>| {
         let url = match response {
@@ -1044,7 +1043,7 @@ pub fn switch_source_header(cx: &mut Context) {
             }
         };
         let path = url.to_file_path().unwrap();
-        if let Err(err) = editor.open(client_id, &path, Action::Replace) {
+        if let Err(err) = editor.open(&path, Action::Replace) {
             let err = format!("failed to open document: {}: {}", path.display(), err);
             editor.set_error(err);
             return;

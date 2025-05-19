@@ -384,6 +384,8 @@ pub struct Config {
     pub whitespace: WhitespaceConfig,
     /// Persistently display open buffers along the top
     pub bufferline: BufferLine,
+    /// Maximum split width
+    pub max_split_width: Option<u16>,
     /// Vertical indent width guides.
     pub indent_guides: IndentGuidesConfig,
     /// Whether to color modes with different colors. Defaults to `false`.
@@ -1127,6 +1129,7 @@ impl Default for Config {
             rulers: Vec::new(),
             whitespace: WhitespaceConfig::default(),
             bufferline: BufferLine::default(),
+            max_split_width: None,
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
             soft_wrap: SoftWrap {
@@ -1336,9 +1339,11 @@ impl Editor {
         // HAXX: offset the render area height by 1 to account for prompt/commandline
         area.height -= 1;
 
+        let max_split_width = conf.max_split_width;
+
         Self {
             mode: Mode::Normal,
-            tree: Tree::new(area),
+            tree: Tree::new(area, max_split_width),
             next_document_id: DocumentId::default(),
             documents: BTreeMap::new(),
             saves: HashMap::new(),
