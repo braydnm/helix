@@ -8,6 +8,10 @@ pub struct Tree {
     pub root: ViewId,
     // (container, index inside the container)
     pub focus: ViewId,
+    // number of columns
+    colwidth: u16,
+    // max split width
+    max_split_width: Option<u16>,
     // fullscreen: bool,
     area: Rect,
 
@@ -82,7 +86,7 @@ impl Default for Container {
 }
 
 impl Tree {
-    pub fn new(area: Rect, nodes: &mut ViewMap) -> Self {
+    pub fn new(area: Rect, nodes: &mut ViewMap, max_split_width: Option<u16>) -> Self {
         let root = Node::container(Layout::Vertical);
 
         let root = nodes.map.insert(root);
@@ -95,6 +99,8 @@ impl Tree {
             focus: root,
             // fullscreen: false,
             area,
+            colwidth: area.width / crossterm::terminal::size().map_or(80, |s| s.0),
+            max_split_width,
             stack: Vec::new(),
         }
     }
@@ -366,9 +372,15 @@ impl Tree {
                             let total_gap = inner_gap * len_u16.saturating_sub(2);
 
                             let used_area = area.width.saturating_sub(total_gap);
-                            let width = used_area / len_u16;
 
-                            let mut child_x = area.x;
+                            let mut width = (used_area / len_u16);
+                            if let Some(max_width) = self.max_split_width {
+                                width = width.min(max_width)
+                            }
+
+                            let padding = (used_area - (width * len_u16)) / 2;
+
+                            let mut child_x = area.x + padding;
 
                             for (i, child) in container.children.iter().enumerate() {
                                 let mut area = Rect::new(
@@ -382,7 +394,8 @@ impl Tree {
                                 // last child takes the remaining width because we can get uneven
                                 // space from rounding
                                 if i == len - 1 {
-                                    area.width = container.area.x + container.area.width - area.x;
+                                    area.width =
+                                        container.area.x + container.area.width - area.x - padding;
                                 }
 
                                 self.stack.push((*child, area));
