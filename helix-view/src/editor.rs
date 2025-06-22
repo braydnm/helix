@@ -2064,7 +2064,7 @@ impl Editor {
                     .iter()
                     .map(|(&doc_id, _)| doc_id)
                     .next()
-                    .unwrap_or_else(|| self.new_document(Document::default(self.config.clone(), self.syn_loader.clone)));
+                    .unwrap_or_else(|| self.new_document(Document::default(self.config.clone(), self.syn_loader.clone())));
                 let view = View::new(doc_id, self.config().gutters.clone());
                 let view_id = client_mut!(self, client_id)
                     .tree

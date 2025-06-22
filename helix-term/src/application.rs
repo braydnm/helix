@@ -868,7 +868,7 @@ impl Application {
             .set_doc_path(doc_save_event.doc_id, &doc_save_event.path);
         // TODO: fix being overwritten by lsp
         self.editor.set_status(format!(
-            "'{}' written, {}L {:.1}B",
+            "'{}' written, {}L {:.1}{}",
             &doc_save_event.path.to_string_lossy(),
             lines,
             sz,
@@ -1057,12 +1057,14 @@ impl Application {
                         log::info!("window/logMessage: {:?}", params);
                     }
                     Notification::ProgressMessage(params)
-                        if !self
+                        if self
                             .clients
                             .by_id(self.editor.most_recent_client_id.unwrap())
-                            .unwrap()
-                            .compositor
-                            .has_component(std::any::type_name::<ui::Prompt>()) =>
+                            .is_some_and(|client| {
+                                !client
+                                    .compositor
+                                    .has_component(std::any::type_name::<ui::Prompt>())
+                            }) =>
                     {
                         let editor_view = self
                             .clients
