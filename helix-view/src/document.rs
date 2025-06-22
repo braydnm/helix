@@ -1284,7 +1284,7 @@ impl Document {
                     // config for the root language of the document. An error must have already
                     // been logged by `LanguageData::syntax_config`.
                     if err != syntax::HighlighterError::NoRootConfig {
-                        log::warn!("Error building syntax for '{}': {err}", self.display_name());
+                        log::warn!("Error building syntax {err}");
                     }
                 })
                 .ok()
