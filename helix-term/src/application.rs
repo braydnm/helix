@@ -86,6 +86,10 @@ impl ApplicationClients {
     pub fn by_id(&mut self, id: ClientId) -> Option<&mut ApplicationClient> {
         self.map.get_mut(&id)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 pub struct Application {
@@ -246,6 +250,8 @@ impl Application {
             crossterm::terminal::Terminal::new(tty, winch_signal_receiver()?),
             tx,
         )?;
+
+        client.terminal.clear();
         let client_id = self.editor.add_client(client.compositor.size(), info.cwd);
         client.id = client_id;
         self.clients.map.insert(client_id, client);
@@ -413,6 +419,7 @@ impl Application {
             anyhow::Ok((client_info, client_tty, client_stdin, client_io_bridge))
         })
         .await??;
+
         let client_id = self.add_client(
             client_info,
             client_tty,
@@ -513,6 +520,10 @@ impl Application {
                         self.clients.map.remove(&client_id);
                         self.clients.socket_streams.remove(&client_id);
                         self.clients.terminal_streams.remove(&client_id);
+                    }
+                    if self.clients.is_empty() {
+                        self.editor.exit_code = Some(0);
+                        return false;
                     }
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {

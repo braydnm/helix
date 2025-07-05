@@ -27,7 +27,7 @@ tokio = { version = "1.38.0", features = ["net"] }
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.0", features = ["fs", "net"] }
+rustix = { version = "1.0.7", features = ["fs", "net"] }
 
 [dev-dependencies]
 tempfile.workspace = true
