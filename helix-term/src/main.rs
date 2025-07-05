@@ -6,7 +6,7 @@ use helix_stdx::socket::{read_fd, write_fd};
 use helix_term::application::{Application, ApplicationClient, ClientInfo};
 use helix_term::args::Args;
 use helix_term::config::{Config, ConfigLoadError};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -126,10 +126,14 @@ FLAGS:
 
     let client_info = ClientInfo::from_args(&args);
 
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+    let mut runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .as_ref()
         .map(PathBuf::from)
-        .unwrap_or(std::env::temp_dir());
+        .unwrap_or(dirs::data_dir().unwrap());
+
+    runtime_dir.push("helix");
+    fs::create_dir_all(&runtime_dir)?;
+    
     // Change directory to $XDG_RUNTIME_DIR. This has three purposes:
     // 1) Flush out any unknown dependencies on the server's current directory.
     // 2) Avoids issues associated with the server retaining a handle to the initial
@@ -137,7 +141,7 @@ FLAGS:
     // 3) Avoids filename length limits on the socket (UNIX_PATH_MAX in sockaddr_un).
     set_current_working_dir(runtime_dir)?;
 
-    let socket_path = Path::new("helix");
+    let socket_path = Path::new("server.sock");
 
     if args.foreground_server {
         let _ = std::fs::remove_file(&socket_path);
@@ -178,6 +182,7 @@ FLAGS:
     });
 
     rmp_serde::encode::write(&mut client_sock, &client_info)?;
+    tty_file()?.write(b"This is a test");
     write_fd(&client_sock, &tty_file()?)?;
     if client_info.has_stdin {
         write_fd(&client_sock, std::io::stdin())?;

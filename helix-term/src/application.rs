@@ -247,6 +247,8 @@ impl Application {
             crossterm::terminal::Terminal::new(tty, winch_signal_receiver()?),
             tx,
         )?;
+
+        client.terminal.clear();
         let client_id = self.editor.add_client(client.compositor.size(), info.cwd);
         client.id = client_id;
         self.clients.map.insert(client_id, client);
@@ -414,6 +416,7 @@ impl Application {
             anyhow::Ok((client_info, client_tty, client_stdin, client_io_bridge))
         })
         .await??;
+
         let client_id = self.add_client(
             client_info,
             client_tty,
