@@ -1,12 +1,19 @@
 use rustix::fd::AsFd;
+use rustix::io::Errno;
 use rustix::net::{
     recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags,
+    SendAncillaryMessage, SendFlags
 };
+
+#[cfg(target_vendor = "apple")]
+use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+
 use std::fs::File;
 use std::io::IoSlice;
 use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
+use std::thread::{sleep, sleep_ms};
+use std::time::Duration;
 
 pub fn write_fd<Fd: AsFd>(socket: Fd, file: impl AsFd) -> io::Result<()> {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
@@ -21,14 +28,31 @@ pub fn read_fd<Fd: AsFd>(socket: Fd) -> io::Result<File> {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut buf = RecvAncillaryBuffer::new(&mut space);
     let mut recv_buf = [0];
-    recvmsg(
-        socket,
+    #[cfg(not(target_vendor = "apple"))]
+    let recv_flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let recv_flags = RecvFlags::empty();
+
+    while let Err(err_code) = recvmsg(
+        &socket,
         &mut [IoSliceMut::new(&mut recv_buf)],
         &mut buf,
-        RecvFlags::CMSG_CLOEXEC,
-    )?;
+        recv_flags
+    ) {
+        if (err_code == Errno::AGAIN || err_code == Errno::WOULDBLOCK) {
+            sleep(Duration::from_micros(50));
+            continue;
+        }
+
+        return Err(err_code.into());
+    }
     if let Some(RecvAncillaryMessage::ScmRights(mut fd)) = buf.drain().next() {
         if let Some(fd) = fd.next() {
+                #[cfg(target_vendor = "apple")]
+                let current_flags = fcntl_getfd(&fd)?;
+                #[cfg(target_vendor = "apple")]
+                fcntl_setfd(&fd, current_flags | FdFlags::CLOEXEC)?;
+
             return Ok(fd.into());
         }
     }
