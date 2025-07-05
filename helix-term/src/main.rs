@@ -1,5 +1,6 @@
 use anyhow::{Context, Error, Result};
 use crossterm::terminal::{tty_file, winch_signal_receiver, Terminal};
+use git2::Repository;
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_stdx::env::set_current_working_dir;
 use helix_stdx::socket::{read_fd, write_fd};
@@ -126,16 +127,11 @@ FLAGS:
 
     let client_info = ClientInfo::from_args(&args);
 
-    let mut runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or(dirs::data_dir().unwrap());
-
-    runtime_dir.push("helix");
-    fs::create_dir_all(&runtime_dir)?;
+    let repo = Repository::discover(".")?;
+    let runtime_dir = repo.workdir().map(PathBuf::from).or(dirs::runtime_dir()).or(dirs::data_dir()).unwrap();
     
     let mut socket_path = runtime_dir.clone();
-    socket_path.push("server.sock");
+    socket_path.push(".helix.sock");
 
     if args.foreground_server {
         let _ = std::fs::remove_file(&socket_path);
