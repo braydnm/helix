@@ -20,6 +20,7 @@ use helix_vcs::DiffProviderRegistry;
 use futures_util::stream::select_all::SelectAll;
 use futures_util::{future, StreamExt};
 use helix_lsp::{Call, LanguageServerId};
+use log::info;
 use slotmap::HopSlotMap;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -2170,16 +2171,21 @@ impl Editor {
     }
 
     pub fn focus_direction(&mut self, client_id: ClientId, direction: tree::Direction) {
+        info!("Changing focus {:?}, {:?}", client_id, direction);
         let current_view = client!(self, client_id).tree.focus;
+        info!("Curent View {:?}", current_view);
+
         if let Some(id) = client!(self, client_id).tree.find_split_in_direction(
             &self.views,
             current_view,
             direction,
         ) {
+            info!("Choosing view with ID {:?}", id);
             self.focus(id);
             return;
         }
 
+        info!("Falling back to temrinal");
         match &self.config().terminal {
             Some(TerminalConfig { command, args: _ }) => {
                 if command != "tmux" {
