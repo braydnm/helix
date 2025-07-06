@@ -1304,7 +1304,9 @@ pub enum Action {
     Load,
     Replace,
     HorizontalSplit,
+    HorizontalSplitAlwaysInWindow,
     VerticalSplit,
+    VerticalSplitAlwaysInWindow,
 }
 
 impl Action {
@@ -1828,7 +1830,10 @@ impl Editor {
                 doc.mark_as_focused();
                 return;
             }
-            Action::HorizontalSplit | Action::VerticalSplit => {
+            Action::HorizontalSplit
+            | Action::VerticalSplit
+            | Action::VerticalSplitAlwaysInWindow
+            | Action::HorizontalSplitAlwaysInWindow => {
                 let focus_lost = self.tree.try_get(self.tree.focus).map(|view| view.doc);
                 // copy the current view, unless there is no view yet
                 let view = self
@@ -1840,8 +1845,12 @@ impl Editor {
                 let view_id = self.tree.split(
                     view,
                     match action {
-                        Action::HorizontalSplit => Layout::Horizontal,
-                        Action::VerticalSplit => Layout::Vertical,
+                        Action::HorizontalSplit | Action::HorizontalSplitAlwaysInWindow => {
+                            Layout::Horizontal
+                        }
+                        Action::VerticalSplit | Action::VerticalSplitAlwaysInWindow => {
+                            Layout::Vertical
+                        }
                         _ => unreachable!(),
                     },
                 );
@@ -1918,8 +1927,27 @@ impl Editor {
     }
 
     // ??? possible use for integration tests
-    pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
+    pub fn open(&mut self, path: &Path, action: Action) -> Result<Option<DocumentId>, DocumentOpenError> {
         let path = helix_stdx::path::canonicalize(path);
+        let divider = match action {
+            Action::HorizontalSplit => Some("-v"),
+            Action::VerticalSplit => Some("-h"),
+            _ => None,
+        };
+        match (divider, get_terminal_provider()) {
+            (Some(divider), Some(terminal)) => {
+                std::process::Command::new(terminal.command)
+                    .args(terminal.args.clone())
+                    .arg(divider)
+                    .arg("--")
+                    .arg(std::env::current_exe()?)
+                    .arg(path)
+                    .spawn()?;
+
+                return Ok(None);
+            }
+            _ => {}
+        }
         let id = self.document_id_by_path(&path);
 
         let id = if let Some(id) = id {
@@ -1955,7 +1983,7 @@ impl Editor {
 
         self.switch(id, action);
 
-        Ok(id)
+        Ok(Some(id))
     }
 
     pub fn close(&mut self, id: ViewId) {

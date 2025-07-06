@@ -135,7 +135,11 @@ fn jump_to_position(
     action: Action,
 ) {
     let doc = match editor.open(path, action) {
-        Ok(id) => doc_mut!(editor, &id),
+        Ok(Some(id)) => doc_mut!(editor, &id),
+        Ok(None) => {
+            log::info!("Opened in another split");
+            return;
+        }
         Err(err) => {
             let err = format!("failed to open path: {:?}: {:?}", path, err);
             editor.set_error(err);

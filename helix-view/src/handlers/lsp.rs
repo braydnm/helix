@@ -97,7 +97,8 @@ impl Editor {
         let path = uri.as_path().expect("URIs are valid paths");
 
         let doc_id = match self.open(path, Action::Load) {
-            Ok(doc_id) => doc_id,
+            Ok(Some(doc_id)) => doc_id,
+            Ok(None) => unreachable!("Action::Load never opens in terminal"),
             Err(err) => {
                 let err = format!(
                     "failed to open document: {}: {}",

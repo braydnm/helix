@@ -404,7 +404,8 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             let doc_id = match &tag.doc {
                 UriOrDocumentId::Id(id) => *id,
                 UriOrDocumentId::Uri(uri) => match cx.editor.open(uri.as_path().expect(""), action) {
-                    Ok(id) => id,
+                    Ok(Some(id)) => id,
+                    Ok(None) => return,
                     Err(e) => {
                         cx.editor
                             .set_error(format!("Failed to open file '{uri:?}': {e}"));

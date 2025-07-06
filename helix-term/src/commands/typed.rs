@@ -939,6 +939,44 @@ fn write_all_quit(
     quit_all_impl(cx, false)
 }
 
+fn write_all_kill(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    write_all_impl(
+        cx,
+        WriteAllOptions {
+            force: false,
+            write_scratch: true,
+            auto_format: true,
+        },
+    )?;
+    quit(cx, _args, event)
+}
+
+fn write_all_kill_force(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    write_all_impl(
+        cx,
+        WriteAllOptions {
+            force: true,
+            write_scratch: true,
+            auto_format: true,
+        },
+    )?;
+    force_quit(cx, _args, event)
+}
+
 fn force_write_all_quit(
     cx: &mut compositor::Context,
     args: Args,
@@ -3212,6 +3250,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "write-kill-all",
+        aliases: &["wka", "ka"],
+        doc: "Write changes from all buffers to disk and close all views.",
+        fun: write_all_kill,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "write-quit-all!",
         aliases: &["wqa!", "xa!"],
         doc: "Forcefully write changes from all buffers to disk, creating necessary subdirectories, and close all views (ignoring unsaved changes).",
@@ -3220,6 +3269,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: Signature {
             positionals: (0, Some(0)),
             flags: &[WRITE_NO_FORMAT_FLAG],
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "write-kill-all!",
+        aliases: &["wka!", "ka!"],
+        doc: "Write changes from all buffers to disk and close all views.",
+        fun: write_all_kill_force,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

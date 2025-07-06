@@ -150,7 +150,7 @@ impl Application {
 
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
-            editor.open(&path, Action::VerticalSplit)?;
+            editor.open(&path, Action::VerticalSplitAlwaysInWindow)?;
             // Unset path to prevent accidentally saving to the original tutor file.
             doc_mut!(editor).set_path(None);
         } else if !args.files.is_empty() {
@@ -178,7 +178,7 @@ impl Application {
                         // option. If neither of those two arguments are passed
                         // in, just load the files normally.
                         let action = match args.split {
-                            _ if nr_of_files == 1 => Action::VerticalSplit,
+                            _ if nr_of_files == 1 => Action::VerticalSplitAlwaysInWindow,
                             Some(Layout::Vertical) => Action::VerticalSplit,
                             Some(Layout::Horizontal) => Action::HorizontalSplit,
                             None => Action::Load,
@@ -191,12 +191,13 @@ impl Application {
                                 continue;
                             }
                             Err(err) => return Err(anyhow::anyhow!(err)),
+                            Ok(None) => continue,
                             // We can't open more than 1 buffer for 1 file, in this case we already have opened this file previously
-                            Ok(doc_id) if old_id == Some(doc_id) => {
+                            Ok(Some(doc_id)) if old_id == Some(doc_id) => {
                                 nr_of_files -= 1;
                                 doc_id
                             }
-                            Ok(doc_id) => doc_id,
+                            Ok(Some(doc_id)) => doc_id,
                         };
                         // with Action::Load all documents have the same view
                         // NOTE: this isn't necessarily true anymore. If
@@ -1222,7 +1223,11 @@ impl Application {
         };
 
         let doc_id = match self.editor.open(path, action) {
-            Ok(id) => id,
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                log::info!("Shown in another split instance");
+                return lsp::ShowDocumentResult { success: true };
+            }
             Err(err) => {
                 log::error!("failed to open path: {:?}: {:?}", uri, err);
                 return lsp::ShowDocumentResult { success: false };

@@ -220,7 +220,8 @@ where
         execute!(
             self.buffer,
             DisableFocusChange,
-            terminal::LeaveAlternateScreen
+            terminal::LeaveAlternateScreen,
+            terminal::Clear(terminal::ClearType::All)
         )?;
         terminal::disable_raw_mode()
     }
