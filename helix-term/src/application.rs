@@ -1,7 +1,7 @@
 use arc_swap::{access::Map, ArcSwap};
 use async_stream::stream;
 use crossterm::terminal::winch_signal_receiver;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Position, Range, Selection};
 use helix_lsp::{
     lsp::{self, notification::Notification},
@@ -303,7 +303,7 @@ impl Application {
 
         if info.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
-            self.editor.open(client_id, &path, Action::VerticalSplit)?;
+            self.editor.open(client_id, &path, Action::VerticalSplitAlwaysInWindow)?;
             // Unset path to prevent accidentally saving to the original tutor file.
             doc_mut!(self.editor, client_id).set_path(None);
         } else if !info.files.is_empty() {
@@ -331,7 +331,7 @@ impl Application {
                         // option. If neither of those two arguments are passed
                         // in, just load the files normally.
                         let action = match info.split {
-                            _ if nr_of_files == 1 => Action::VerticalSplit,
+                            _ if nr_of_files == 1 => Action::VerticalSplitAlwaysInWindow,
                             Some(Layout::Vertical) => Action::VerticalSplit,
                             Some(Layout::Horizontal) => Action::HorizontalSplit,
                             None => Action::Load,
@@ -344,12 +344,13 @@ impl Application {
                                 continue;
                             }
                             Err(err) => return Err(anyhow::anyhow!(err)),
+                            Ok(None) => continue,
                             // We can't open more than 1 buffer for 1 file, in this case we already have opened this file previously
-                            Ok(doc_id) if old_id == Some(doc_id) => {
+                            Ok(Some(doc_id)) if old_id == Some(doc_id) => {
                                 nr_of_files -= 1;
                                 doc_id
                             }
-                            Ok(doc_id) => doc_id,
+                            Ok(Some(doc_id)) => doc_id,
                         };
                         // with Action::Load all documents have the same view
                         // NOTE: this isn't necessarily true anymore. If
@@ -935,7 +936,6 @@ impl Application {
             return false;
         }
 
-        info!("Handling event {:?}", event);
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             client_id: client.id,
@@ -1394,7 +1394,11 @@ impl Application {
 
         let most_recent_client = self.editor.most_recent_client_id.unwrap();
         let doc_id = match self.editor.open(most_recent_client, path, action) {
-            Ok(id) => id,
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                log::info!("Shown in another split instance");
+                return lsp::ShowDocumentResult { success: true};
+            }
             Err(err) => {
                 log::error!("failed to open path: {:?}: {:?}", uri, err);
                 return lsp::ShowDocumentResult { success: false };
@@ -1468,7 +1472,6 @@ impl Application {
             self.editor.exit_code = Some(1);
             eprintln!("Error: {}", err);
         }
-
         Ok(self.editor.exit_code.unwrap())
     }
 

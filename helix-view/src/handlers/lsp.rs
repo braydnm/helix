@@ -88,7 +88,7 @@ impl Editor {
         let path = uri.as_path().expect("URIs are valid paths");
 
         let doc_id = match self.open(client_id, path, Action::Load) {
-            Ok(doc_id) => doc_id,
+            Ok(doc_id) => doc_id.unwrap(),
             Err(err) => {
                 let err = format!(
                     "failed to open document: {}: {}",

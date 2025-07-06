@@ -2660,7 +2660,11 @@ fn global_search(cx: &mut Context) {
         config,
         move |cx, FileResult { path, line_num, .. }, action| {
             let doc = match cx.editor.open(cx.client_id, path, action) {
-                Ok(id) => doc_with_id_mut!(cx.editor, &id),
+                Ok(Some(id)) => doc_with_id_mut!(cx.editor, &id),
+                Ok(None) => {
+                    log::warn!("Opened in another window");
+                    return;
+                }
                 Err(e) => {
                     cx.editor
                         .set_error(format!("Failed to open file '{}': {}", path.display(), e));

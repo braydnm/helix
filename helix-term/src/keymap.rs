@@ -334,6 +334,8 @@ impl Keymaps {
         let keymaps = &*self.map();
         let keymap = &keymaps[&mode];
 
+        log::info!("Looking up key {:?} in mode {:?}", key, mode);
+
         if key!(Esc) == key {
             if !self.state.is_empty() {
                 // Note that Esc is not included here
