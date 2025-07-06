@@ -127,8 +127,11 @@ FLAGS:
 
     let client_info = ClientInfo::from_args(&args);
 
-    let repo = Repository::discover(std::env::current_dir()?)?;
-    let runtime_dir = repo.workdir().map(PathBuf::from).or(dirs::runtime_dir()).or(dirs::data_dir()).unwrap();
+    let runtime_dir = if let Ok(repo) = Repository::discover(std::env::current_dir()?) {
+        PathBuf::from(repo.workdir().unwrap())
+    } else {
+        dirs::runtime_dir().or(dirs::data_dir()).unwrap()
+    };
     
     let mut socket_path = runtime_dir.clone();
     socket_path.push(".helix.sock");
