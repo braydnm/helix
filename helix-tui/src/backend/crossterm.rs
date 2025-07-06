@@ -216,8 +216,9 @@ impl Backend for CrosstermBackend {
         execute!(
             self.terminal,
             DisableFocusChange,
-            terminal::LeaveAlternateScreen
-        )?;
+            terminal::LeaveAlternateScreen,
+            terminal::Clear(terminal::ClearType::All)
+        );
         self.terminal.disable_raw_mode()
     }
 

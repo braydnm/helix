@@ -4,7 +4,7 @@ mod query;
 use crate::{
     alt,
     compositor::{self, Component, Compositor, Context, Event, EventResult},
-    ctrl, key, shift,
+    ctrl, key, shift, ctrl_shift,
     ui::{
         self,
         document::{render_document, LinePos, TextRenderer},
@@ -1128,9 +1128,23 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                 }
                 return close_fn(self);
             }
+
             ctrl!('v') => {
                 if let Some(option) = self.selection() {
                     (self.callback_fn)(ctx, option, Action::VerticalSplit);
+                }
+                return close_fn(self);
+            }
+            ctrl_shift!('s') => {
+                if let Some(option) = self.selection() {
+                    (self.callback_fn)(ctx, option, Action::HorizontalSplitAlwaysInWindow);
+                }
+                return close_fn(self);
+            }
+
+            ctrl_shift!('v') => {
+                if let Some(option) = self.selection() {
+                    (self.callback_fn)(ctx, option, Action::VerticalSplitAlwaysInWindow);
                 }
                 return close_fn(self);
             }

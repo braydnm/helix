@@ -127,7 +127,7 @@ FLAGS:
 
     let client_info = ClientInfo::from_args(&args);
 
-    let repo = Repository::discover(".")?;
+    let repo = Repository::discover(std::env::current_dir()?)?;
     let runtime_dir = repo.workdir().map(PathBuf::from).or(dirs::runtime_dir()).or(dirs::data_dir()).unwrap();
     
     let mut socket_path = runtime_dir.clone();
@@ -186,15 +186,16 @@ async fn client(socket: UnixStream) -> Result<i32> {
     let mut signals = Signals::new([signal::SIGTSTP, signal::SIGCONT, signal::SIGWINCH])?;
 
     use futures_util::StreamExt;
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0];
 
     loop {
         tokio::select! {
             Some(signal) = signals.next() => {
                 socket.write_u8(signal as u8).await?;
             }
-            _ = socket.readable() => {
-                let mut buf = [0];
-                match socket.try_read(&mut buf) {
+            result = socket.read(&mut buf) => {
+                match result {
                     Ok(0) => break,
                     Ok(_) => {
                         return Ok(buf[0] as i32);
