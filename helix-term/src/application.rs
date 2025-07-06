@@ -509,6 +509,7 @@ impl Application {
                 }
                 Some((client_id, event)) = self.clients.terminal_streams.next() => {
                     self.editor.most_recent_client_id = Some(client_id);
+
                     if self.handle_terminal_events(client_id, event).await {
                         self.render().await;
                     }
@@ -934,6 +935,7 @@ impl Application {
             return false;
         }
 
+        info!("Handling event {:?}", event);
         let mut cx = crate::compositor::Context {
             editor: &mut self.editor,
             client_id: client.id,
