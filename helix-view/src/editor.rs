@@ -1764,6 +1764,33 @@ impl Editor {
             return;
         }
 
+        if let Some(path) = self.documents.get(&id).unwrap().path() {
+            let path = helix_stdx::path::canonicalize(
+                client!(self, client_id).cwd.clone(),
+                self.documents.get(&id).unwrap().path().unwrap(),
+            );
+            let divider = match action {
+                Action::HorizontalSplit => Some("-v"),
+                Action::VerticalSplit => Some("-h"),
+                _ => None,
+            };
+            match (divider, get_terminal_provider()) {
+                (Some(divider), Some(terminal)) => {
+                    std::process::Command::new(terminal.command)
+                        .args(terminal.args.clone())
+                        .arg(divider)
+                        .arg("--")
+                        .arg(std::env::current_exe().unwrap())
+                        .arg(path)
+                        .spawn()
+                        .unwrap();
+
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if !matches!(action, Action::Load) {
             self.enter_normal_mode(client_id);
         }
