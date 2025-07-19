@@ -1767,7 +1767,7 @@ impl Editor {
         if let Some(path) = self.documents.get(&id).unwrap().path() {
             let path = helix_stdx::path::canonicalize(
                 client!(self, client_id).cwd.clone(),
-                self.documents.get(&id).unwrap().path().unwrap(),
+                path,
             );
             let divider = match action {
                 Action::HorizontalSplit => Some("-v"),
