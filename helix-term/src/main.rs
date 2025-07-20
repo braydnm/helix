@@ -133,7 +133,7 @@ FLAGS:
         dirs::runtime_dir().or(dirs::data_dir()).unwrap()
     };
     
-    let mut socket_path = args.working_directory.unwrap_or(runtime_dir.clone());
+    let mut socket_path = args.working_directory.as_ref().unwrap_or(&runtime_dir).clone();
     socket_path.push(".helix.sock");
 
     if args.foreground_server {

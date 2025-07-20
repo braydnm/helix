@@ -385,10 +385,11 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             let _doc_id = match &tag.doc {
                 UriOrDocumentId::Id(id) => *id,
                 UriOrDocumentId::Uri(uri) => match cx.editor.open(cx.client_id, uri.as_path().expect(""), action) {
-                    Ok(id) => id,
+                    Ok(Some(id)) => id,
+                    Ok(None) => return, // File was opened in another split instance
                     Err(e) => {
                         cx.editor
-                            .set_error(format!("Failed to open file '{uri:?}': {e}"));
+                            .set_error(format!("Failed to open file '{uri}': {e}"));
                         return;
                     }
                 }
