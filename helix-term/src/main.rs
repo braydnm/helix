@@ -80,6 +80,8 @@ FLAGS:
     --vsplit                       Splits all given files vertically into different windows
     --hsplit                       Splits all given files horizontally into different windows
     -w, --working-dir <path>       Specify an initial working directory
+    --language <language>          Override language detection for all files
+    --set <key=value>              Set a runtime configuration option
     +N                             Open the first given file at line number N
 ",
             env!("CARGO_PKG_NAME"),
@@ -127,18 +129,34 @@ FLAGS:
 
     let client_info = ClientInfo::from_args(&args);
 
+    // Use isolated socket for instances with custom language or settings
+    let use_isolated_instance = args.language.is_some() || !args.set_options.is_empty();
+
     let runtime_dir = if let Ok(repo) = Repository::discover(std::env::current_dir()?) {
         PathBuf::from(repo.workdir().unwrap())
     } else {
         dirs::runtime_dir().or(dirs::data_dir()).unwrap()
     };
-    
-    let mut socket_path = args.working_directory.as_ref().unwrap_or(&runtime_dir).clone();
-    socket_path.push(".helix.sock");
 
-    if args.foreground_server {
+    let mut socket_path = args.working_directory.as_ref().unwrap_or(&runtime_dir).clone();
+
+    if use_isolated_instance {
+        // Use a unique socket path for this isolated instance
+        socket_path.push(format!(".helix-isolated-{}.sock", std::process::id()));
+    } else {
+        socket_path.push(".helix.sock");
+    }
+
+    if args.foreground_server || use_isolated_instance {
         let _ = std::fs::remove_file(&socket_path);
-        std::process::exit(server(args, &socket_path).unwrap());
+        let exit_code = server(args, &socket_path).unwrap();
+
+        // Clean up isolated socket file when exiting
+        if use_isolated_instance {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+
+        std::process::exit(exit_code);
     }
 
     let client_sock = UnixStream::connect(&socket_path);

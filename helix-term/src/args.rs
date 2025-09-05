@@ -20,6 +20,8 @@ pub struct Args {
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
     pub foreground_server: bool,
+    pub language: Option<String>,
+    pub set_options: IndexMap<String, String>,
 }
 
 impl Args {
@@ -90,6 +92,20 @@ impl Args {
                     None => {
                         anyhow::bail!("--working-dir must specify an initial working directory")
                     }
+                },
+                "--language" => match argv.next().as_deref() {
+                    Some(lang) => args.language = Some(lang.to_string()),
+                    None => anyhow::bail!("--language must specify a language name"),
+                },
+                "--set" => match argv.next().as_deref() {
+                    Some(option_expr) => {
+                        if let Some((key, value)) = option_expr.split_once('=') {
+                            args.set_options.insert(key.to_string(), value.to_string());
+                        } else {
+                            anyhow::bail!("--set must be in the format key=value");
+                        }
+                    }
+                    None => anyhow::bail!("--set must specify an option in key=value format"),
                 },
                 arg if arg.starts_with("--") => {
                     anyhow::bail!("unexpected double dash argument: {}", arg)

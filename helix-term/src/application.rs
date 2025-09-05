@@ -3,6 +3,7 @@ use async_stream::stream;
 use crossterm::terminal::winch_signal_receiver;
 use futures_util::{Stream, StreamExt};
 use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Position, Range, Selection};
+use indexmap::IndexMap;
 use helix_lsp::{
     lsp::{self, notification::Notification},
     util::lsp_range_to_range,
@@ -171,6 +172,8 @@ pub struct ClientInfo {
     files: Vec<(PathBuf, Vec<Position>)>,
     pub pgid: i32,
     pub has_stdin: bool,
+    language: Option<String>,
+    set_options: IndexMap<String, String>,
 }
 
 impl ClientInfo {
@@ -187,6 +190,8 @@ impl ClientInfo {
             // SAFETY: It's perfectly safe, I assure you.
             pgid: unsafe { libc::getpgrp() },
             has_stdin: unsafe { libc::isatty(libc::STDIN_FILENO) == 0 },
+            language: args.language.clone(),
+            set_options: args.set_options.clone(),
         }
     }
 }
@@ -251,8 +256,12 @@ impl Application {
             tx,
         )?;
 
-        client.terminal.clear();
-        let client_id = self.editor.add_client(client.compositor.size(), info.cwd);
+        let client_id = self.editor.add_client(
+            client.compositor.size(),
+            info.cwd,
+            info.language.clone(),
+            info.set_options.clone(),
+        );
         client.id = client_id;
         self.clients.map.insert(client_id, client);
         let client = self.clients.map.get_mut(&client_id).unwrap();
@@ -1503,5 +1512,43 @@ impl Application {
         }
 
         errs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::Args;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_client_info_serialization() {
+        // Create a test Args with language and set_options
+        let mut args = Args::default();
+        args.language = Some("rust".to_string());
+        args.set_options.insert("editor.line-number".to_string(), "absolute".to_string());
+        args.set_options.insert("editor.theme".to_string(), "onedark".to_string());
+        args.files.insert(PathBuf::from("test.rs"), vec![Position::new(0, 0)]);
+
+        // Create ClientInfo from args
+        let client_info = ClientInfo::from_args(&args);
+
+        // Test MessagePack serialization/deserialization
+        let serialized = rmp_serde::to_vec(&client_info).expect("Failed to serialize ClientInfo");
+        let deserialized: ClientInfo = rmp_serde::from_slice(&serialized)
+            .expect("Failed to deserialize ClientInfo");
+
+        // Verify the fields are preserved
+        assert_eq!(deserialized.language, Some("rust".to_string()));
+        assert_eq!(deserialized.set_options.len(), 2);
+        assert_eq!(
+            deserialized.set_options.get("editor.line-number"),
+            Some(&"absolute".to_string())
+        );
+        assert_eq!(
+            deserialized.set_options.get("editor.theme"),
+            Some(&"onedark".to_string())
+        );
+        assert_eq!(deserialized.files.len(), 1);
     }
 }
