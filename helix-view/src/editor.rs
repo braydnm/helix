@@ -20,6 +20,7 @@ use helix_vcs::DiffProviderRegistry;
 use futures_util::stream::select_all::SelectAll;
 use futures_util::{future, StreamExt};
 use helix_lsp::{Call, LanguageServerId};
+use indexmap::IndexMap;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use std::{
@@ -40,6 +41,7 @@ use tokio::{
 };
 
 use anyhow::{anyhow, bail, Error};
+use serde_json::Value;
 
 pub use helix_core::diagnostic::Severity;
 use helix_core::{
@@ -1258,6 +1260,11 @@ pub struct Editor {
 
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
+
+    /// Language override for new documents (from --language flag)
+    pub language_override: Option<String>,
+    /// Runtime configuration overrides (from --set flags)
+    pub set_options: IndexMap<String, String>,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -1385,8 +1392,40 @@ impl Editor {
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
+            language_override: None,
+            set_options: IndexMap::new(),
         }
     }
+
+    pub fn apply_config_overrides(&mut self, set_options: &IndexMap<String, String>) -> Result<(), Error> {
+        use std::ops::Deref;
+
+        let mut config = serde_json::json!(self.config().deref());
+
+        for (key, value) in set_options {
+            let key = key.to_lowercase();
+            let pointer = format!("/{}", key.replace('.', "/"));
+
+            if let Some(config_value) = config.pointer_mut(&pointer) {
+                *config_value = if config_value.is_string() {
+                    Value::String(value.to_string())
+                } else {
+                    value.parse().map_err(|_| anyhow!("Could not parse field `{}`", value))?
+                };
+            } else {
+                log::warn!("Unknown config key: {}", key);
+            }
+        }
+
+        let new_config: Config = serde_json::from_value(config)
+            .map_err(|e| anyhow!("Invalid config values: {}", e))?;
+
+        self.config_events.0.send(ConfigEvent::Update(Box::new(new_config)))
+            .map_err(|e| anyhow!("Failed to send config update: {}", e))?;
+
+        Ok(())
+    }
+
 
     pub fn popup_border(&self) -> bool {
         self.config().popup_border == PopupBorderConfig::All
@@ -1764,10 +1803,7 @@ impl Editor {
         }
 
         if let Some(path) = self.documents.get(&id).unwrap().path() {
-            let path = helix_stdx::path::canonicalize(
-                client!(self, client_id).cwd.clone(),
-                self.documents.get(&id).unwrap().path().unwrap(),
-            );
+            let path = helix_stdx::path::canonicalize(path);
             let divider = match action {
                 Action::HorizontalSplit => Some("-v"),
                 Action::VerticalSplit => Some("-h"),
@@ -1983,10 +2019,14 @@ impl Editor {
             let mut doc = Document::open(
                 &path,
                 None,
-                true,
+                false, // Don't detect language yet
                 self.config.clone(),
                 self.syn_loader.clone(),
             )?;
+
+            // Apply language override if present
+            let loader = self.syn_loader.load();
+            doc.detect_language_with_override(&loader, self.language_override.as_deref());
 
             let diagnostics =
                 Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, &doc);

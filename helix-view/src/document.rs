@@ -1177,6 +1177,24 @@ impl Document {
         self.set_language(self.detect_language_config(loader), loader);
     }
 
+    /// Detect language with optional override
+    pub fn detect_language_with_override(
+        &mut self,
+        loader: &syntax::Loader,
+        language_override: Option<&str>,
+    ) {
+        let language_config = if let Some(override_lang) = language_override {
+            // Try to find the language by name first
+            loader
+                .language_for_name(override_lang)
+                .map(|lang| loader.language(lang).config().clone())
+        } else {
+            self.detect_language_config(loader)
+        };
+        
+        self.set_language(language_config, loader);
+    }
+
     /// Detect the programming language based on the file type.
     pub fn detect_language_config(
         &self,

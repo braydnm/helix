@@ -1624,6 +1624,7 @@ dependencies = [
  "helix-stdx",
  "helix-tui",
  "helix-vcs",
+ "indexmap",
  "kstring",
  "libc",
  "log",

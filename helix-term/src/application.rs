@@ -138,6 +138,14 @@ impl Application {
             })),
             handlers,
         );
+        editor.language_override = args.language.clone();
+        editor.set_options = args.set_options.clone();
+        if !args.set_options.is_empty() {
+            if let Err(err) = editor.apply_config_overrides(&args.set_options) {
+                log::warn!("Failed to apply config overrides: {}", err);
+            }
+        }
+
         Self::load_configured_theme(&mut editor, &config.load(), &mut terminal, theme_mode);
 
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
