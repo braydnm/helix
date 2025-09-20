@@ -11,6 +11,7 @@ use helix_lsp::{
 };
 use helix_stdx::socket::read_fd;
 use helix_view::{
+    doc_mut, current,
     align_view,
     document::{DocumentOpenError, DocumentSavedEventResult},
     editor::{ConfigEvent, EditorEvent},
@@ -97,7 +98,7 @@ impl ApplicationClients {
 
 pub struct Application {
     clients: ApplicationClients,
-    listener: UnixListener,
+    listener: Option<UnixListener>,
 
     pub editor: Editor,
 
@@ -235,7 +236,7 @@ impl Application {
             },
 
             editor,
-            listener,
+            listener: Some(listener),
 
             config,
 
@@ -247,6 +248,184 @@ impl Application {
 
         Ok(app)
     }
+
+    pub fn new_standalone(
+        config: Config,
+        lang_loader: syntax::Loader,
+    ) -> Result<Self, Error> {
+        #[cfg(feature = "integration")]
+        setup_integration_logging();
+        let mut theme_parent_dirs = vec![helix_loader::config_dir()];
+        theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
+        let theme_loader = theme::Loader::new(&theme_parent_dirs);
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let handlers = handlers::setup(config.clone());
+        let editor = Editor::new(
+            Arc::new(theme_loader),
+            Arc::new(ArcSwap::from_pointee(lang_loader)),
+            Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
+                &config.editor
+            })),
+            handlers,
+        );
+        #[cfg(not(windows))]
+        let signals = Signals::new([signal::SIGUSR1]).ok();
+        let app = Self {
+            clients: ApplicationClients {
+                map: HashMap::new(),
+                terminal_streams: StreamMap::new(),
+                socket_streams: StreamMap::new(),
+            },
+            editor,
+            listener: None,
+            config,
+            jobs: Jobs::new(),
+            lsp_progress: LspProgressMap::new(),
+            #[cfg(not(windows))]
+            signals,
+        };
+        Ok(app)
+    }
+
+    pub async fn run_standalone(&mut self, args: Args) -> Result<i32, Error> {
+        // Standalone mode always requires an interactive TTY
+        // Set up terminal for standalone mode
+        crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        crossterm::execute!(
+            stdout,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
+            crossterm::cursor::Hide
+        )?;
+
+        // Create a dummy pipe for socket communication (required by ApplicationClient)
+        let (tx, _rx) = tokio::net::UnixStream::pair()?;
+        let (_read_half, write_half) = tx.into_split();
+
+        // Create the application client
+        let pgid = unsafe { libc::getpgrp() };
+        let tty = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .or_else(|_| std::fs::File::open("/dev/stdout"))?;
+        let terminal = crossterm::terminal::Terminal::new(
+            tty,
+            crossterm::terminal::winch_signal_receiver()?
+        );
+
+        let mut client = ApplicationClient::new(
+            self.config.load().editor.clone(),
+            pgid,
+            terminal,
+            write_half,
+        )?;
+
+        // Create client info from args
+        let client_info = ClientInfo::from_args(&args);
+
+        // Add the client to the editor
+        let client_id = self.editor.add_client(
+            client.compositor.size(),
+            client_info.cwd,
+            client_info.language,
+            client_info.set_options,
+        );
+        client.id = client_id;
+        self.editor.most_recent_client_id = Some(client_id);
+
+        // Set up the terminal stream
+        let mut terminal_input = client.terminal.backend_mut().take_input_stream();
+        let terminal_event = Box::pin(stream! {
+            use futures_util::StreamExt;
+            while let Some(event) = terminal_input.next().await {
+                yield event;
+            }
+        });
+
+        // Add client to the application
+        self.clients.terminal_streams.insert(client_id, terminal_event);
+        self.clients.map.insert(client_id, client);
+        let client = self.clients.map.get_mut(&client_id).unwrap();
+
+        // Set up the editor view with keymaps
+        let keys = Box::new(Map::new(Arc::clone(&self.config), |config: &Config| {
+            &config.keys
+        }));
+        let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys)));
+        client.compositor.push(editor_view);
+
+        // Open files if specified
+        if client_info.load_tutor {
+            let path = helix_loader::runtime_file(std::path::Path::new("tutor"));
+            self.editor.open(client_id, &path, helix_view::editor::Action::VerticalSplitAlwaysInWindow)?;
+            // Unset path to prevent accidentally saving to the original tutor file.
+            doc_mut!(self.editor, client_id).set_path(None);
+        } else if !client_info.files.is_empty() {
+            let mut first_file = true;
+            for (path, positions) in client_info.files {
+                let action = if first_file {
+                    first_file = false;
+                    // First file should always create a window
+                    match client_info.split {
+                        Some(helix_view::tree::Layout::Vertical) => helix_view::editor::Action::VerticalSplitAlwaysInWindow,
+                        Some(helix_view::tree::Layout::Horizontal) => helix_view::editor::Action::HorizontalSplitAlwaysInWindow,
+                        None => helix_view::editor::Action::VerticalSplitAlwaysInWindow,
+                    }
+                } else {
+                    // Subsequent files follow the split layout
+                    match client_info.split {
+                        Some(helix_view::tree::Layout::Vertical) => helix_view::editor::Action::VerticalSplit,
+                        Some(helix_view::tree::Layout::Horizontal) => helix_view::editor::Action::HorizontalSplit,
+                        None => helix_view::editor::Action::Load,
+                    }
+                };
+                self.editor.open(client_id, &path, action)?;
+                // Apply positions to the document
+                for position in positions {
+                    if position.row > 0 || position.col > 0 {
+                        let (_client, view, doc) = current!(self.editor, client_id);
+                        let text = doc.text();
+                        let pos = helix_core::pos_at_coords(text.slice(..), position.into(), true);
+                        doc.set_selection(view.id, helix_core::Selection::point(pos));
+                    }
+                }
+            }
+        } else {
+            // Create a new empty buffer if no files were specified
+            self.editor.new_file(client_id, helix_view::editor::Action::VerticalSplitAlwaysInWindow);
+        }
+
+        Self::load_configured_theme(&mut self.editor, &self.config.load());
+
+        // Exit the alternate screen and disable raw mode before panicking
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = TerminalBackend::force_restore();
+            hook(info);
+        }));
+
+        // Run the event loop
+        self.event_loop().await;
+        let close_errs = self.close().await;
+
+        // Restore terminal
+        if let Some(client) = self.clients.map.get_mut(&client_id) {
+            if !client!(self.editor, client_id).suspended {
+                Application::restore_term(client, &self.config)?;
+            }
+        }
+
+        // Log before processing close errors
+        for err in close_errs {
+            self.editor.exit_code = Some(1);
+            eprintln!("Error: {}", err);
+        }
+
+        Ok(self.editor.exit_code.unwrap_or(0))
+    }
+
 
     pub fn add_client(
         &mut self,
@@ -519,7 +698,12 @@ impl Application {
             tokio::select! {
                 biased;
 
-                result = self.listener.accept() => {
+                result = async {
+                    match &self.listener {
+                        Some(listener) => listener.accept().await,
+                        None => std::future::pending().await
+                    }
+                } => {
                     let (client_sock, _) = result.unwrap();
                     self.accept_client(client_sock).await.unwrap();
                     self.render().await;

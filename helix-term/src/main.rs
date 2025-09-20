@@ -68,6 +68,7 @@ ARGS:
 FLAGS:
     -h, --help                     Prints help information
     --tutor                        Loads the tutorial
+    --standalone                   Runs the editor in standalone mode (no client-server architecture)
     --health [CATEGORY]            Checks for potential errors in editor setup
                                    CATEGORY can be a language or one of 'clipboard', 'languages'
                                    or 'all'. 'all' is the default if not specified.
@@ -127,10 +128,56 @@ FLAGS:
         std::process::exit(0);
     }
 
-    let client_info = ClientInfo::from_args(&args);
+    // Handle standalone mode (explicit flag or when language/set options are specified)
+    if args.standalone || args.language.is_some() || !args.set_options.is_empty() {
+        helix_loader::initialize_config_file(args.config_file.clone());
+        helix_loader::initialize_log_file(args.log_file.clone());
 
-    // Use isolated socket for instances with custom language or settings
-    let use_isolated_instance = args.language.is_some() || !args.set_options.is_empty();
+        setup_logging(args.verbosity).context("failed to initialize logging")?;
+
+        // NOTE: Set the working directory early so the correct configuration is loaded
+        if let Some(path) = &args.working_directory {
+            helix_stdx::env::set_current_working_dir(path)?;
+        } else if let Some((path, _)) = args.files.first().filter(|p| p.0.is_dir()) {
+            // If the first file is a directory, it will be the working directory unless -w was specified
+            helix_stdx::env::set_current_working_dir(path)?;
+        }
+
+        let config = match Config::load_default() {
+            Ok(config) => config,
+            Err(ConfigLoadError::Error(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Config::default()
+            }
+            Err(ConfigLoadError::Error(err)) => return Err(Error::new(err)),
+            Err(ConfigLoadError::BadConfig(err)) => {
+                eprintln!("Bad config: {}", err);
+                eprintln!("Press <ENTER> to continue with default config");
+                use std::io::Read;
+                let _ = std::io::stdin().read(&mut []);
+                Config::default()
+            }
+        };
+
+        let lang_loader = helix_core::config::user_lang_loader().unwrap_or_else(|err| {
+            eprintln!("{}", err);
+            eprintln!("Press <ENTER> to continue with default language config");
+            use std::io::Read;
+            // This waits for an enter press.
+            let _ = std::io::stdin().read(&mut []);
+            helix_core::config::default_lang_loader()
+        });
+
+        let exit_code = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                let mut app = Application::new_standalone(config, lang_loader)
+                    .context("unable to start Helix in standalone mode")?;
+                app.run_standalone(args).await
+            })?;
+        std::process::exit(exit_code);
+    }
+
+    let client_info = ClientInfo::from_args(&args);
 
     let runtime_dir = if let Ok(repo) = Repository::discover(std::env::current_dir()?) {
         PathBuf::from(repo.workdir().unwrap())
@@ -139,24 +186,11 @@ FLAGS:
     };
 
     let mut socket_path = args.working_directory.as_ref().unwrap_or(&runtime_dir).clone();
+    socket_path.push(".helix.sock");
 
-    if use_isolated_instance {
-        // Use a unique socket path for this isolated instance
-        socket_path.push(format!(".helix-isolated-{}.sock", std::process::id()));
-    } else {
-        socket_path.push(".helix.sock");
-    }
-
-    if args.foreground_server || use_isolated_instance {
+    if args.foreground_server {
         let _ = std::fs::remove_file(&socket_path);
-        let exit_code = server(args, &socket_path).unwrap();
-
-        // Clean up isolated socket file when exiting
-        if use_isolated_instance {
-            let _ = std::fs::remove_file(&socket_path);
-        }
-
-        std::process::exit(exit_code);
+        std::process::exit(server(args, &socket_path).unwrap());
     }
 
     let client_sock = UnixStream::connect(&socket_path);

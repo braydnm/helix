@@ -20,6 +20,7 @@ pub struct Args {
     pub files: IndexMap<PathBuf, Vec<Position>>,
     pub working_directory: Option<PathBuf>,
     pub foreground_server: bool,
+    pub standalone: bool,
     pub language: Option<String>,
     pub set_options: IndexMap<String, String>,
 }
@@ -52,6 +53,7 @@ impl Args {
                 "--help" => args.display_help = true,
                 "--tutor" => args.load_tutor = true,
                 "--server" => args.foreground_server = true,
+                "--standalone" => args.standalone = true,
                 "--vsplit" => match args.split {
                     Some(_) => anyhow::bail!("can only set a split once of a specific type"),
                     None => args.split = Some(Layout::Vertical),
