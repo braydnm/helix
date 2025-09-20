@@ -204,7 +204,7 @@ FLAGS:
 #[tokio::main]
 async fn client(socket: UnixStream) -> Result<i32> {
     let mut socket = tokio::net::UnixStream::from_std(socket)?;
-    let mut signals = Signals::new([signal::SIGTSTP, signal::SIGCONT, signal::SIGWINCH])?;
+    let mut signals = Signals::new([signal::SIGTSTP, signal::SIGCONT, signal::SIGWINCH, signal::SIGUSR1])?;
 
     use futures_util::StreamExt;
     use tokio::io::AsyncReadExt;
@@ -213,6 +213,11 @@ async fn client(socket: UnixStream) -> Result<i32> {
     loop {
         tokio::select! {
             Some(signal) = signals.next() => {
+                // SIGUSR1 is handled locally - don't forward to server
+                if signal == signal::SIGUSR1 {
+                    // Client ignores SIGUSR1 - it's meant for the server process
+                    continue;
+                }
                 socket.write_u8(signal as u8).await?;
             }
             result = socket.read(&mut buf) => {

@@ -57,6 +57,8 @@ use anyhow::Error;
 use crossterm::{event::Event as CrosstermEvent, tty::IsTty};
 #[cfg(not(windows))]
 use signal_hook::consts::signal;
+#[cfg(not(windows))]
+use signal_hook_tokio::Signals;
 #[cfg(windows)]
 type Signals = futures_util::stream::Empty<()>;
 
@@ -103,6 +105,8 @@ pub struct Application {
 
     jobs: Jobs,
     lsp_progress: LspProgressMap,
+    #[cfg(not(windows))]
+    signals: Option<Signals>,
 }
 
 #[cfg(feature = "integration")]
@@ -220,6 +224,9 @@ impl Application {
             handlers,
         );
 
+        #[cfg(not(windows))]
+        let signals = Signals::new([signal::SIGUSR1]).ok();
+
         let app = Self {
             clients: ApplicationClients {
                 map: HashMap::new(),
@@ -234,6 +241,8 @@ impl Application {
 
             jobs: Jobs::new(),
             lsp_progress: LspProgressMap::new(),
+            #[cfg(not(windows))]
+            signals,
         };
 
         Ok(app)
@@ -504,6 +513,9 @@ impl Application {
 
             use futures_util::StreamExt;
 
+            #[cfg(not(windows))]
+            let mut signal_stream = self.signals.as_mut();
+
             tokio::select! {
                 biased;
 
@@ -564,6 +576,22 @@ impl Application {
                         if _idle_handled {
                             return true;
                         }
+                    }
+                }
+                Some(signal) = async {
+                    #[cfg(not(windows))]
+                    if let Some(ref mut sigs) = signal_stream {
+                        sigs.next().await
+                    } else {
+                        None
+                    }
+                    #[cfg(windows)]
+                    None
+                }, if cfg!(not(windows)) => {
+                    #[cfg(not(windows))]
+                    if signal == signal::SIGUSR1 {
+                        self.refresh_config();
+                        self.render().await;
                     }
                 }
             }
@@ -791,11 +819,6 @@ impl Application {
                 client
                     .compositor
                     .handle_event(&Event::Resize(area.width, area.height), &mut cx);
-                Application::render_client(client, &mut self.editor, &mut self.jobs).await;
-            }
-            Some(signal::SIGUSR1) => {
-                self.refresh_config();
-                let client = self.clients.map.get_mut(&client_id).unwrap();
                 Application::render_client(client, &mut self.editor, &mut self.jobs).await;
             }
             Some(signal::SIGTERM) | Some(signal::SIGINT) | None => {
