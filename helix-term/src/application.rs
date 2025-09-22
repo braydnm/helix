@@ -289,15 +289,6 @@ impl Application {
 
     pub async fn run_standalone(&mut self, args: Args) -> Result<i32, Error> {
         // Standalone mode always requires an interactive TTY
-        // Set up terminal for standalone mode
-        crossterm::terminal::enable_raw_mode()?;
-        let mut stdout = std::io::stdout();
-        crossterm::execute!(
-            stdout,
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
-            crossterm::cursor::Hide
-        )?;
 
         // Create a dummy pipe for socket communication (required by ApplicationClient)
         let (tx, _rx) = tokio::net::UnixStream::pair()?;
@@ -399,6 +390,9 @@ impl Application {
 
         Self::load_configured_theme(&mut self.editor, &self.config.load());
 
+        // Claim terminal properly for the client (replaces manual terminal setup)
+        Application::claim_term(self.clients.map.get_mut(&client_id).unwrap(), &self.config).await?;
+
         // Exit the alternate screen and disable raw mode before panicking
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -410,7 +404,7 @@ impl Application {
         self.event_loop().await;
         let close_errs = self.close().await;
 
-        // Restore terminal
+        // Restore terminal properly
         if let Some(client) = self.clients.map.get_mut(&client_id) {
             if !client!(self.editor, client_id).suspended {
                 Application::restore_term(client, &self.config)?;
