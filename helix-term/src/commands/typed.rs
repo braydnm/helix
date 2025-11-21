@@ -2897,6 +2897,64 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
     Ok(())
 }
 
+fn man(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    ensure!(!args.is_empty(), "Usage: :man <page>");
+
+    if std::env::var("TMUX").is_err() {
+        bail!("Not running inside tmux");
+    }
+
+    let page = args.join(" ");
+    let command = format!("tmux split-window -h 'man {}'", page);
+
+    let shell = cx.editor.config().shell.clone();
+    let callback = async move {
+        let _output = shell_impl_async(&shell, &command, None).await?;
+        let call: job::Callback = Callback::EditorCompositor(
+            Box::new(move |editor: &mut Editor, _compositor: &mut Compositor| {
+                editor.set_status(format!("Opened man page: {}", page));
+            }),
+        );
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn vman(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    ensure!(!args.is_empty(), "Usage: :vman <page>");
+
+    if std::env::var("TMUX").is_err() {
+        bail!("Not running inside tmux");
+    }
+
+    let page = args.join(" ");
+    let command = format!("tmux split-window -v 'man {}'", page);
+
+    let shell = cx.editor.config().shell.clone();
+    let callback = async move {
+        let _output = shell_impl_async(&shell, &command, None).await?;
+        let call: job::Callback = Callback::EditorCompositor(
+            Box::new(move |editor: &mut Editor, _compositor: &mut Compositor| {
+                editor.set_status(format!("Opened man page: {}", page));
+            }),
+        );
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 /// This command accepts a single boolean --skip-visible flag and no positionals.
 const BUFFER_CLOSE_OTHERS_SIGNATURE: Signature = Signature {
     positionals: (0, Some(0)),
@@ -4033,6 +4091,30 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "man",
+        aliases: &[],
+        doc: "Open a man page in a vertical tmux split",
+        fun: man,
+        completer: CommandCompleter::positional(&[completers::program]),
+        signature: Signature {
+            positionals: (1, None),
+            raw_after: Some(1),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "vman",
+        aliases: &[],
+        doc: "Open a man page in a horizontal tmux split",
+        fun: vman,
+        completer: CommandCompleter::positional(&[completers::program]),
+        signature: Signature {
+            positionals: (1, None),
+            raw_after: Some(1),
             ..Signature::DEFAULT
         },
     },
