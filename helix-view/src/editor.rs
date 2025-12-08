@@ -2145,10 +2145,18 @@ impl Editor {
 
                 if view.doc == doc_id {
                     // something was previously open in the view, switch to previous doc
-                    if let Some(prev_doc) = view.docs_access_history.pop() {
+                    // Keep popping from history until we find a document that still exists
+                    let mut found_doc = None;
+                    while let Some(prev_doc) = view.docs_access_history.pop() {
+                        if self.documents.contains_key(&prev_doc) {
+                            found_doc = Some(prev_doc);
+                            break;
+                        }
+                    }
+                    if let Some(prev_doc) = found_doc {
                         Some(Action::ReplaceDoc(view.id, prev_doc))
                     } else {
-                        // only the document that is being closed was in the view, close it
+                        // no valid documents in history, close the view
                         Some(Action::Close(view.id))
                     }
                 } else {
@@ -2168,7 +2176,10 @@ impl Editor {
             }
         }
 
-        let doc = self.documents.remove(&doc_id).unwrap();
+        let doc = match self.documents.remove(&doc_id) {
+            Some(doc) => doc,
+            None => return Ok(()), // Document was already removed by a recursive call
+        };
 
         if ensure_view {
             // If the document we removed was visible in all views, we will have no more views. We don't
