@@ -31,11 +31,12 @@ assets = [
 ]
 
 [features]
-default = ["git"]
+default = ["git", "watchman_client"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
 git = ["helix-vcs/git"]
 native = ["helix-loader/native"]
+no-auto-reload = []
 
 [[bin]]
 name = "hx"
@@ -73,7 +74,7 @@ log = "0.4"
 
 # File picker
 nucleo.workspace = true
-ignore = "0.4"
+ignore = "=0.4.23"
 # markdown doc rendering
 pulldown-cmark = { version = "0.13", default-features = false }
 # file type detection
@@ -91,11 +92,13 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 
 # ripgrep for global search
-grep-regex = "0.1.13"
-grep-searcher = "0.1.14"
-rmp-serde = "1.3.0"
+grep-regex = "=0.1.13"
+grep-searcher = "=0.1.14"
+rmp-serde = "=1.3.0"
 tokio-util = { version = "0.7.15", features = ["io", "io-util"] }
 async-stream = "0.3.6"
+
+watchman_client = { version = "0.9", optional = true }
 
 [target.'cfg(not(windows))'.dependencies]  # https://github.com/vorner/signal-hook/issues/100
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }

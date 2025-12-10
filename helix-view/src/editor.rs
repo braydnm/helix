@@ -30,7 +30,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{self, stdin},
+    io::{self},
     num::{NonZeroU8, NonZeroUsize},
     ops::DerefMut,
     path::{Path, PathBuf},

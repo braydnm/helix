@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::IoSlice;
 use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
-use std::thread::{sleep, sleep_ms};
+use std::thread::sleep;
 use std::time::Duration;
 
 pub fn write_fd<Fd: AsFd>(socket: Fd, file: impl AsFd) -> io::Result<()> {
@@ -39,7 +39,7 @@ pub fn read_fd<Fd: AsFd>(socket: Fd) -> io::Result<File> {
         &mut buf,
         recv_flags
     ) {
-        if (err_code == Errno::AGAIN || err_code == Errno::WOULDBLOCK) {
+        if err_code == Errno::AGAIN || err_code == Errno::WOULDBLOCK {
             sleep(Duration::from_micros(50));
             continue;
         }
