@@ -215,12 +215,7 @@ impl Backend for CrosstermBackend {
         if self.supports_bracketed_paste {
             execute!(self.terminal, DisableBracketedPaste,)?;
         }
-        execute!(
-            self.terminal,
-            DisableFocusChange,
-            terminal::LeaveAlternateScreen,
-            terminal::Clear(terminal::ClearType::All)
-        );
+        execute!(self.terminal, DisableFocusChange, LeaveAlternateScreenCustom)?;
         self.terminal.disable_raw_mode()
     }
 
