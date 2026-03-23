@@ -42,4 +42,6 @@ pub trait Backend {
     fn size(&self) -> Result<Rect, io::Error>;
     /// Flushes the terminal buffer
     fn flush(&mut self) -> Result<(), io::Error>;
+    fn get_theme_mode(&self) -> Option<helix_view::theme::Mode>;
+
 }

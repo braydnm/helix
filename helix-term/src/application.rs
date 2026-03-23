@@ -108,6 +108,8 @@ pub struct Application {
     lsp_progress: LspProgressMap,
     #[cfg(not(windows))]
     signals: Option<Signals>,
+
+    theme_mode: Option<theme::Mode>,
 }
 
 #[cfg(feature = "integration")]
@@ -244,6 +246,7 @@ impl Application {
             lsp_progress: LspProgressMap::new(),
             #[cfg(not(windows))]
             signals,
+            theme_mode: None,
         };
 
         Ok(app)
@@ -283,6 +286,7 @@ impl Application {
             lsp_progress: LspProgressMap::new(),
             #[cfg(not(windows))]
             signals,
+            theme_mode: None,
         };
         Ok(app)
     }
@@ -312,6 +316,7 @@ impl Application {
             terminal,
             write_half,
         )?;
+        self.theme_mode = client.terminal.backend().get_theme_mode();
 
         // Create client info from args
         let client_info = ClientInfo::from_args(&args);
@@ -388,7 +393,7 @@ impl Application {
             self.editor.new_file(client_id, helix_view::editor::Action::VerticalSplitAlwaysInWindow);
         }
 
-        Self::load_configured_theme(&mut self.editor, &self.config.load());
+        Self::load_configured_theme(&mut self.editor, &self.config.load(), self.theme_mode);
 
         // Claim terminal properly for the client (replaces manual terminal setup)
         Application::claim_term(self.clients.map.get_mut(&client_id).unwrap(), &self.config).await?;
@@ -437,6 +442,7 @@ impl Application {
             crossterm::terminal::Terminal::new(tty, winch_signal_receiver()?),
             tx,
         )?;
+        self.theme_mode = client.terminal.backend().get_theme_mode();
 
         let client_id = self.editor.add_client(
             client.compositor.size(),
@@ -589,7 +595,7 @@ impl Application {
                 .unwrap_or_else(|_| self.editor.new_file(client_id, Action::VerticalSplit));
         }
 
-        Self::load_configured_theme(&mut self.editor, &self.config.load());
+        Self::load_configured_theme(&mut self.editor, &self.config.load(), self.theme_mode);
 
         Ok(client_id)
     }
@@ -832,7 +838,7 @@ impl Application {
             // the sake of locals highlighting.
             let lang_loader = helix_core::config::user_lang_loader()?;
             self.editor.syn_loader.store(Arc::new(lang_loader));
-            Self::load_configured_theme(&mut self.editor, &default_config);
+            Self::load_configured_theme(&mut self.editor, &default_config, self.theme_mode);
 
             // Re-parse any open documents with the new language config.
             let lang_loader = self.editor.syn_loader.load();
@@ -872,12 +878,17 @@ impl Application {
     }
 
     /// Load the theme set in configuration
-    fn load_configured_theme(editor: &mut Editor, config: &Config) {
+    fn load_configured_theme(
+        editor: &mut Editor,
+        config: &Config,
+        mode: Option<theme::Mode>,
+    ) {
         let true_color = config.editor.true_color || crate::true_color();
         let theme = config
             .theme
             .as_ref()
-            .and_then(|theme| {
+            .and_then(|theme_config| {
+                let theme = theme_config.choose(mode);
                 editor
                     .theme_loader
                     .load(theme)

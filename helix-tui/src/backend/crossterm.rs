@@ -340,6 +340,10 @@ impl Backend for CrosstermBackend {
     fn flush(&mut self) -> io::Result<()> {
         self.terminal.flush()
     }
+
+    fn get_theme_mode(&self) -> Option<helix_view::theme::Mode> {
+        None
+    }
 }
 
 #[derive(Debug)]
