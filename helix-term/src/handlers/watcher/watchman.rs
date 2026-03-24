@@ -115,11 +115,16 @@ impl WatchmanWatcher {
             )
             .await?;
 
+        let project_dir = resolved.path();
+
         loop {
             match subscription.next().await {
                 Ok(data) => {
                     match data {
                         SubscriptionData::FilesChanged(result) => {
+                            if result.is_fresh_instance {
+                                continue;
+                            }
                             if let Some(files) = result.files {
                                 let watched = watched_paths.read().await;
 
@@ -128,7 +133,7 @@ impl WatchmanWatcher {
                                     let full_path = if file_path.is_absolute() {
                                         file_path
                                     } else {
-                                        resolved.project_root().join(&file_path)
+                                        project_dir.join(&file_path)
                                     };
 
                                     if watched.contains(&full_path) {
