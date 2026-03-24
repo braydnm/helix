@@ -99,6 +99,8 @@ notify-debouncer-full = "0.4.0"
 inotify = "0.11.0"
 
 watchman_client = { version = "0.9", optional = true }
+jj-lib = "0.39.0"
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 

@@ -70,6 +70,18 @@ pub fn render(context: &mut RenderContext, viewport: Rect, surface: &mut Surface
         });
     }
 
+    if let Some(session) = &context.editor.merge_session {
+        let role = session.find_role(context.doc.id());
+        if let Some(role) = role {
+            let label = match role {
+                helix_view::merge::MergeRole::Base => " [base] ".to_string(),
+                helix_view::merge::MergeRole::Side(i) => format!(" [side {}] ", i + 1),
+            };
+            let merge_style = context.editor.theme.get("ui.statusline");
+            append(&mut context.parts.left, Span::styled(label, merge_style), base_style);
+        }
+    }
+
     surface.set_spans(
         viewport.x,
         viewport.y,

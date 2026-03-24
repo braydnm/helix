@@ -1260,6 +1260,7 @@ pub struct Editor {
 
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
+    pub merge_session: Option<crate::merge::MergeSession>,
 
     /// Language override for new documents (from --language flag)
     pub language_override: Option<String>,
@@ -1391,6 +1392,7 @@ impl Editor {
             handlers,
             mouse_down_range: None,
             cursor_cache: CursorCache::default(),
+            merge_session: None,
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
             language_override: None,
             set_options: IndexMap::new(),
@@ -1935,7 +1937,7 @@ impl Editor {
     }
 
     /// Generate an id for a new document and register it.
-    fn new_document(&mut self, mut doc: Document) -> DocumentId {
+    pub fn new_document(&mut self, mut doc: Document) -> DocumentId {
         let id = self.next_document_id;
         // Safety: adding 1 from 1 is fine, practically impossible to reach usize max
         self.next_document_id =
@@ -2063,6 +2065,21 @@ impl Editor {
     }
 
     pub fn close_document(&mut self, doc_id: DocumentId, force: bool) -> Result<(), CloseError> {
+        if let Some(session) = self.merge_session.take() {
+            if session.find_role(doc_id).is_some() {
+                let all_ids = session.all_doc_ids();
+                for id in all_ids {
+                    if id != doc_id {
+                        let _ = self.close_document(id, true);
+                    }
+                }
+                // Force-close the triggering doc too (skip modified check)
+                return self.close_document(doc_id, true);
+            } else {
+                self.merge_session = Some(session);
+            }
+        }
+
         let doc = match self.documents.get(&doc_id) {
             Some(doc) => doc,
             None => return Err(CloseError::DoesNotExist),

@@ -24,6 +24,10 @@ helix-lsp = { path = "../helix-lsp" }
 helix-dap = { path = "../helix-dap" }
 helix-vcs = { path = "../helix-vcs" }
 
+jj-lib = "0.39.0"
+bstr = "1"
+pollster = "0.4"
+
 bitflags.workspace = true
 anyhow = "1"
 termina = { workspace = true, optional = true }

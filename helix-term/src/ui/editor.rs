@@ -116,6 +116,46 @@ impl EditorView {
             decorations.add_decoration(line_decoration);
         }
 
+        if editor.merge_session.as_ref().is_some_and(|s| s.find_role(doc.id()).is_some()) {
+            if let Some(diff_handle) = doc.diff_handle() {
+                let hunks = diff_handle.load();
+                let to_bg = |style: Style| -> Style {
+                    Style {
+                        bg: style.fg.or(style.bg),
+                        ..Style::default()
+                    }
+                };
+                let added_style = to_bg(theme.get("diff.plus"));
+                let deleted_style = to_bg(theme.get("diff.minus"));
+                let modified_style = to_bg(theme.get("diff.delta"));
+                let mut hunk_i = 0;
+                let mut hunk = hunks.nth_hunk(hunk_i);
+                let line_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
+                    while hunk.after.end < pos.doc_line as u32
+                        || !hunk.is_pure_removal() && pos.doc_line as u32 == hunk.after.end
+                    {
+                        hunk_i += 1;
+                        hunk = hunks.nth_hunk(hunk_i);
+                    }
+                    if hunk.after.start > pos.doc_line as u32 {
+                        return;
+                    }
+                    let style = if hunk.is_pure_insertion() {
+                        added_style
+                    } else if hunk.is_pure_removal() {
+                        deleted_style
+                    } else {
+                        modified_style
+                    };
+                    renderer.set_style(
+                        Rect::new(inner.x, pos.visual_line, inner.width, 1),
+                        style,
+                    );
+                };
+                decorations.add_decoration(line_decoration);
+            }
+        }
+
         let syntax_highlighter =
             Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
         let mut overlays = Vec::new();

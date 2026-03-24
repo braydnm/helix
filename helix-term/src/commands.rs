@@ -1,9 +1,15 @@
 pub(crate) mod dap;
 pub(crate) mod lsp;
+pub(crate) mod merge;
 pub(crate) mod syntax;
 pub(crate) mod typed;
 
 pub use dap::*;
+pub use merge::{
+    goto_next_conflict, goto_prev_conflict, merge_accept, merge_conflict_picker, merge_focus,
+    merge_focus_or_select_regex, merge_push, merge_redo, merge_redo_or_redo, merge_undo,
+    merge_undo_or_undo,
+};
 use futures_util::FutureExt;
 use helix_event::status;
 use helix_stdx::{
@@ -617,6 +623,17 @@ impl MappableCommand {
         rotate_selections_first, "Make the first selection your primary one",
         rotate_selections_last, "Make the last selection your primary one",
         switch_source_header, "Switch source/header",
+        merge_conflict_picker, "Open merge conflict picker",
+        goto_next_conflict, "Goto next conflict in merge view",
+        goto_prev_conflict, "Goto previous conflict in merge view",
+        merge_accept, "Accept side into base in merge view",
+        merge_push, "Push current side to base in merge view",
+        merge_focus, "Focus a merge pane (b/0 = base, 1..N = side)",
+        merge_focus_or_select_regex, "select_regex outside merge buffers; merge_focus inside",
+        merge_undo, "Undo against the merge base document",
+        merge_redo, "Redo against the merge base document",
+        merge_undo_or_undo, "undo outside merge buffers; merge_undo inside",
+        merge_redo_or_redo, "redo outside merge buffers; merge_redo inside",
     );
 }
 
@@ -2103,7 +2120,7 @@ fn select_all(cx: &mut Context) {
     doc.set_selection(view.id, Selection::single(0, end))
 }
 
-fn select_regex(cx: &mut Context) {
+pub(crate) fn select_regex(cx: &mut Context) {
     let reg = cx.register.unwrap_or('/');
     ui::regex_prompt(
         cx,
@@ -4609,7 +4626,7 @@ pub mod insert {
 
 // Undo / Redo
 
-fn undo(cx: &mut Context) {
+pub(crate) fn undo(cx: &mut Context) {
     let count = cx.count();
     let (view, doc) = current!(cx.editor);
     for _ in 0..count {
@@ -4620,7 +4637,7 @@ fn undo(cx: &mut Context) {
     }
 }
 
-fn redo(cx: &mut Context) {
+pub(crate) fn redo(cx: &mut Context) {
     let count = cx.count();
     let (view, doc) = current!(cx.editor);
     for _ in 0..count {

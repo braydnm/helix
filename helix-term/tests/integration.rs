@@ -20,6 +20,7 @@ mod test {
     mod command_line;
     mod commands;
     mod languages;
+    mod merge;
     mod movement;
     mod splits;
 }

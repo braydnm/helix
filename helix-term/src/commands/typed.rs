@@ -113,6 +113,11 @@ fn quit(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow
         return Ok(());
     }
 
+    if cx.editor.merge_session.is_some() {
+        super::merge::tear_down_session_on_editor(cx.editor);
+        return Ok(());
+    }
+
     // last view and we have unsaved changes
     if cx.editor.tree.views().count() == 1 {
         buffers_remaining_impl(cx.editor)?
@@ -380,6 +385,17 @@ fn write_impl(
     path: Option<&str>,
     options: WriteOptions,
 ) -> anyhow::Result<()> {
+    // When a merge session is active, `:w` always materializes the merge state
+    // back to the original file, regardless of which pane is focused. Side
+    // documents are scratch buffers without paths, and the materialization
+    // pulls from base + all sides at once — there's nothing meaningful to save
+    // per-pane. We must intercept before the autoformat path because formatters
+    // would mangle the materialized output (which may still contain conflict
+    // markers for unresolved regions).
+    if cx.editor.merge_session.is_some() {
+        return merge_save(cx.editor, path, options.force);
+    }
+
     let config = cx.editor.config();
     let jobs = &mut cx.jobs;
     let (view, doc) = current!(cx.editor);
@@ -417,6 +433,79 @@ fn write_impl(
     if fmt.is_none() {
         let id = doc.id();
         cx.editor.save(id, path, options.force)?;
+    }
+
+    Ok(())
+}
+
+fn merge_save(
+    editor: &mut Editor,
+    path: Option<&str>,
+    _force: bool,
+) -> anyhow::Result<()> {
+    use helix_view::merge;
+
+    super::merge::refresh_regions(editor);
+
+    let session = editor
+        .merge_session
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No active merge session"))?;
+
+    let base_doc = editor
+        .documents
+        .get(&session.base.doc_id)
+        .ok_or_else(|| anyhow::anyhow!("Base document not found"))?;
+    let base_text: String = base_doc.text().to_string();
+
+    let side_texts: Vec<String> = session
+        .sides
+        .iter()
+        .map(|side| {
+            editor
+                .documents
+                .get(&side.doc_id)
+                .map(|doc| doc.text().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let side_text_refs: Vec<&str> = side_texts.iter().map(|s| s.as_str()).collect();
+
+    let output = merge::materialize_conflicts(
+        &base_text,
+        &side_text_refs,
+        &session.conflict_regions,
+        session.conflict_marker_len,
+    );
+
+    let target_path = path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| session.original_path.clone());
+
+    std::fs::write(&target_path, &output)?;
+
+    let remaining = session.unresolved_count();
+
+    let all_ids = session.all_doc_ids();
+    for doc_id in all_ids {
+        if let Some(doc) = editor.documents.get_mut(&doc_id) {
+            doc.reset_modified();
+        }
+    }
+
+    if remaining == 0 {
+        super::merge::finalize_merge_session(editor, &target_path)?;
+        editor.set_status(format!(
+            "Wrote {} (all conflicts resolved)",
+            target_path.display()
+        ));
+    } else {
+        editor.set_status(format!(
+            "Wrote {} ({} unresolved conflicts remain)",
+            target_path.display(),
+            remaining
+        ));
     }
 
     Ok(())
@@ -997,6 +1086,9 @@ fn force_write_all_quit(
 }
 
 fn quit_all_impl(cx: &mut compositor::Context, force: bool) -> anyhow::Result<()> {
+    if cx.editor.merge_session.is_some() {
+        super::merge::tear_down_session_on_editor(cx.editor);
+    }
     cx.block_try_flush_writes()?;
     if !force {
         buffers_remaining_impl(cx.editor)?;

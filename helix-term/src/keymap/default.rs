@@ -79,7 +79,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "A-C" => copy_selection_on_prev_line,
 
 
-        "s" => select_regex,
+        "s" => merge_focus_or_select_regex,
         "A-s" => split_selection_on_newline,
         "A-minus" => merge_selections,
         "A-_" => merge_consecutive_selections,
@@ -99,6 +99,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "x" => extend_line_below,
         "X" => extend_to_line_bounds,
         "A-x" => shrink_to_line_bounds,
+
+        "+" => merge_accept,
 
         "m" => { "Match"
             "m" => match_brackets,
@@ -120,7 +122,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "e" => goto_prev_entry,
             "T" => goto_prev_test,
             "p" => goto_prev_paragraph,
-            "x" => goto_prev_xml_element,
+            "x" => goto_prev_conflict,
+            "+" => merge_accept,
             "space" => add_newline_above,
         },
         "]" => { "Right bracket"
@@ -135,7 +138,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "e" => goto_next_entry,
             "T" => goto_next_test,
             "p" => goto_next_paragraph,
-            "x" => goto_next_xml_element,
+            "x" => goto_next_conflict,
             "space" => add_newline_below,
         },
 
@@ -146,8 +149,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "*" => search_selection_detect_word_boundaries,
         "A-*" => search_selection,
 
-        "u" => undo,
-        "U" => redo,
+        "u" => merge_undo_or_undo,
+        "U" => merge_redo_or_redo,
         "A-u" => earlier,
         "A-U" => later,
 
@@ -296,6 +299,7 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
             "C" => toggle_block_comments,
             "A-c" => toggle_line_comments,
             "?" => command_palette,
+            "m" => merge_conflict_picker,
         },
         "z" => { "View"
             "z" | "c" => align_view_center,
