@@ -50,6 +50,10 @@ pub struct MergeSession {
     pub original_base_text: String,
     pub original_side_texts: Vec<String>,
     pub original_regions: Vec<ConflictRegion>,
+    /// Owns the on-disk backing files for each merge pane so language servers
+    /// have a real URL to attach to. Dropped on tear-down, which deletes the
+    /// directory and everything inside.
+    pub _tempdir: Option<tempfile::TempDir>,
 }
 
 impl MergeSession {
@@ -122,7 +126,7 @@ fn count_lines(s: &[u8]) -> usize {
 }
 
 pub fn parse_conflict_file(content: &[u8]) -> Option<ParsedConflict> {
-    for num_sides in 2..=4 {
+    for num_sides in 2..=8 {
         if let Some(parsed) = try_parse_with_sides(content, num_sides) {
             return Some(parsed);
         }
@@ -479,9 +483,18 @@ pub fn materialize_conflicts(
                 side_slices.push(slice);
             }
 
-            let mut merge_values: Vec<Vec<u8>> = vec![side_slices[0].clone()];
-            merge_values.push(base_slice);
-            for side in &side_slices[1..] {
+            // jj_lib::Merge expects an alternating add/remove vector of length
+            // 2N-1: [side0, base, side1, base, side2, ..., base, sideN-1].
+            // Reusing the same base slice between each pair is an
+            // approximation (the original conflict may have had distinct
+            // bases per pair) but matches what we surfaced during parsing,
+            // where we only kept the first `removes()` entry.
+            let mut merge_values: Vec<Vec<u8>> =
+                Vec::with_capacity(side_slices.len() * 2 - 1);
+            for (i, side) in side_slices.iter().enumerate() {
+                if i > 0 {
+                    merge_values.push(base_slice.clone());
+                }
                 merge_values.push(side.clone());
             }
             let merge = Merge::from_vec(merge_values);
@@ -655,6 +668,7 @@ mod tests {
             original_base_text: String::new(),
             original_side_texts: vec![String::new(), String::new()],
             original_regions: regions,
+            _tempdir: None,
         }
     }
 
@@ -722,6 +736,7 @@ mod tests {
             original_base_text: String::new(),
             original_side_texts: Vec::new(),
             original_regions: Vec::new(),
+            _tempdir: None,
         };
         assert_eq!(session.find_role(base_id), Some(MergeRole::Base));
     }
@@ -991,6 +1006,7 @@ mod tests {
             original_base_text: String::new(),
             original_side_texts: Vec::new(),
             original_regions: Vec::new(),
+            _tempdir: None,
         };
 
         let found = session.find_side_by_view(base_view).unwrap();

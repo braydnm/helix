@@ -74,60 +74,119 @@ fn open_merge_session_on_editor(editor: &mut helix_view::Editor, path: &Path) {
 
     let base_text_bytes = parsed.base_text.as_bytes().to_vec();
     let num_sides = parsed.num_sides;
-    let left_count = num_sides / 2;
+    // Distribute as evenly as possible across left/right; an odd count puts
+    // the extra side on the left (ceil(N/2) left, floor(N/2) right).
+    let left_count = num_sides.div_ceil(2);
+    let right_count = num_sides - left_count;
 
-    let mut sides = Vec::with_capacity(num_sides);
-
-    // Layout: [left_sides... | base | right_sides...]
-
-    // Left sides
-    let first_side_doc_id = create_merge_doc(editor, &parsed.side_texts[0], path);
-    {
-        let doc = editor.documents.get_mut(&first_side_doc_id).unwrap();
-        doc.set_diff_base(base_text_bytes.clone());
-    }
-    editor.switch(first_side_doc_id, Action::Replace);
-    let first_view_id = editor.tree.focus;
-    sides.push(MergeSide {
-        doc_id: first_side_doc_id,
-        view_id: first_view_id,
+    let mut sides: Vec<MergeSide> = Vec::with_capacity(num_sides);
+    sides.resize_with(num_sides, || MergeSide {
+        doc_id: helix_view::DocumentId::default(),
+        view_id: helix_view::ViewId::default(),
         role: MergeRole::Side(0),
     });
 
-    for i in 1..left_count {
-        let side_doc_id = create_merge_doc(editor, &parsed.side_texts[i], path);
-        {
-            let doc = editor.documents.get_mut(&side_doc_id).unwrap();
+    // One scratch dir per session so language servers have a real URL to
+    // attach to. Prefer tmpfs (`/dev/shm`) so the side files stay in RAM;
+    // fall back to the system temp dir on platforms without it. Dropped with
+    // the session, which deletes the directory.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("helix-merge-");
+    let tempdir = builder
+        .tempdir_in("/dev/shm")
+        .or_else(|_| builder.tempdir())
+        .ok();
+
+    let make_side = |editor: &mut helix_view::Editor, idx: usize| -> helix_view::DocumentId {
+        let doc_id = create_side_doc(
+            editor,
+            &parsed.side_texts[idx],
+            path,
+            tempdir.as_ref(),
+            &format!("side{}", idx + 1),
+        );
+        if let Some(doc) = editor.documents.get_mut(&doc_id) {
             doc.set_diff_base(base_text_bytes.clone());
         }
-        editor.switch(side_doc_id, Action::VerticalSplitAlwaysInWindow);
-        let view_id = editor.tree.focus;
-        sides.push(MergeSide {
-            doc_id: side_doc_id,
-            view_id,
-            role: MergeRole::Side(i),
-        });
-    }
+        doc_id
+    };
 
-    // Base (center)
-    let base_doc_id = create_merge_doc(editor, &parsed.base_text, path);
+    // Layout shape we want at the root container (Vertical):
+    //   [ left-column | base | right-column ]
+    // where each column is a Horizontal container holding its sides stacked
+    // top-to-bottom. We build root left-to-right because Tree::split appends
+    // *after* the focused node, and helix has no "split-left" action.
+    //
+    // Step 1: open left_side[0] in the current viewport.
+    let left0_doc = make_side(editor, 0);
+    editor.switch(left0_doc, Action::Replace);
+    editor.refresh_language_servers(left0_doc);
+    sides[0] = MergeSide {
+        doc_id: left0_doc,
+        view_id: editor.tree.focus,
+        role: MergeRole::Side(0),
+    };
+    let left0_view_id = sides[0].view_id;
+
+    // Step 2: open base to the right of left_side[0] (root layout matches → appended).
+    //
+    // Base (center) — use the original repo path so the LSP attaches with the
+    // real project context (workspace root, pyproject.toml, etc.). The rope
+    // we hold in memory is the parsed base text, distinct from the on-disk
+    // conflict-marker content; merge_save is the only thing that writes back.
+    let base_doc_id = create_base_doc(editor, &parsed.base_text, path);
     editor.switch(base_doc_id, Action::VerticalSplitAlwaysInWindow);
+    editor.refresh_language_servers(base_doc_id);
     let base_view_id = editor.tree.focus;
 
-    // Right sides
-    for i in left_count..num_sides {
-        let side_doc_id = create_merge_doc(editor, &parsed.side_texts[i], path);
-        {
-            let doc = editor.documents.get_mut(&side_doc_id).unwrap();
-            doc.set_diff_base(base_text_bytes.clone());
+    // Step 3: open right_side[0] to the right of base (still appending in root).
+    let mut last_right_view: Option<helix_view::ViewId> = None;
+    if right_count > 0 {
+        let right0_doc = make_side(editor, left_count);
+        editor.switch(right0_doc, Action::VerticalSplitAlwaysInWindow);
+        editor.refresh_language_servers(right0_doc);
+        sides[left_count] = MergeSide {
+            doc_id: right0_doc,
+            view_id: editor.tree.focus,
+            role: MergeRole::Side(left_count),
+        };
+        last_right_view = Some(sides[left_count].view_id);
+    }
+
+    // Step 4: stack additional right sides under the right column. The first
+    // HorizontalSplit promotes the right column to a Horizontal container;
+    // subsequent ones append within it.
+    for i in 1..right_count {
+        let idx = left_count + i;
+        let doc_id = make_side(editor, idx);
+        if let Some(prev) = last_right_view {
+            editor.focus(prev);
         }
-        editor.switch(side_doc_id, Action::VerticalSplitAlwaysInWindow);
-        let view_id = editor.tree.focus;
-        sides.push(MergeSide {
-            doc_id: side_doc_id,
-            view_id,
+        editor.switch(doc_id, Action::HorizontalSplitAlwaysInWindow);
+        editor.refresh_language_servers(doc_id);
+        sides[idx] = MergeSide {
+            doc_id,
+            view_id: editor.tree.focus,
+            role: MergeRole::Side(idx),
+        };
+        last_right_view = Some(sides[idx].view_id);
+    }
+
+    // Step 5: stack additional left sides under the left column. Focus the
+    // most recently opened left view each iteration so the horizontal splits
+    // chain into one column.
+    let mut last_left_view = left0_view_id;
+    for i in 1..left_count {
+        let doc_id = make_side(editor, i);
+        editor.focus(last_left_view);
+        editor.switch(doc_id, Action::HorizontalSplitAlwaysInWindow);
+        editor.refresh_language_servers(doc_id);
+        sides[i] = MergeSide {
+            doc_id,
+            view_id: editor.tree.focus,
             role: MergeRole::Side(i),
-        });
+        };
+        last_left_view = sides[i].view_id;
     }
 
     editor.tree.focus = base_view_id;
@@ -157,6 +216,7 @@ fn open_merge_session_on_editor(editor: &mut helix_view::Editor, path: &Path) {
         original_base_text,
         original_side_texts: parsed.side_texts,
         original_regions,
+        _tempdir: tempdir,
     });
 
     let unresolved = editor
@@ -167,35 +227,75 @@ fn open_merge_session_on_editor(editor: &mut helix_view::Editor, path: &Path) {
     editor.set_status(format!("Merge view: {} conflicts", unresolved));
 }
 
-fn create_merge_doc(
+/// Side documents are tempdir-backed (so the LSP attaches via a real path) but
+/// marked read-only — only the base pane should accept edits.
+fn create_side_doc(
     editor: &mut helix_view::Editor,
     text: &str,
     original_path: &Path,
+    tempdir: Option<&tempfile::TempDir>,
+    role_label: &str,
 ) -> helix_view::DocumentId {
     let rope = Rope::from_str(text);
     let mut doc = Document::from(rope, None, editor.config.clone(), editor.syn_loader.clone());
 
-    let ext = original_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let prefix = original_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("merge");
-
-    if let Ok(tmp) = tempfile::Builder::new()
-        .prefix(prefix)
-        .suffix(&format!(".{ext}"))
-        .tempfile()
-    {
-        let tmp_path = tmp.path().to_path_buf();
-        doc.set_path(Some(&tmp_path));
-        let loader = editor.syn_loader.load();
-        doc.detect_language(&loader);
-        doc.set_path(None);
-        let _ = fs::remove_file(&tmp_path);
+    if let Some(td) = tempdir {
+        let ext = original_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let prefix = original_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("merge");
+        let file_name = if ext.is_empty() {
+            format!("{prefix}.{role_label}")
+        } else {
+            format!("{prefix}.{role_label}.{ext}")
+        };
+        let path = td.path().join(file_name);
+        if fs::write(&path, text).is_ok() {
+            doc.set_path(Some(&path));
+            let loader = editor.syn_loader.load();
+            doc.detect_language(&loader);
+        }
     }
+
+    doc.readonly = true;
+
+    editor.new_document(doc)
+}
+
+/// Base document points at the actual repo file. The rope holds the parsed
+/// base text rather than the on-disk conflict-marker content; merge_save is
+/// the sole writer back to disk.
+///
+/// Mirrors the setup that `Editor::open` performs (editor_config from
+/// `.editorconfig`, indent/line-ending detection, language override, replayed
+/// diagnostics) so per-project tooling — pylsp/pyright, ruff, clangd config,
+/// etc. — sees the same context it would for a normal open of `original_path`.
+fn create_base_doc(
+    editor: &mut helix_view::Editor,
+    text: &str,
+    original_path: &Path,
+) -> helix_view::DocumentId {
+    let canonical = helix_stdx::path::canonicalize(original_path);
+    let rope = Rope::from_str(text);
+    let mut doc = Document::from(rope, None, editor.config.clone(), editor.syn_loader.clone());
+    doc.set_path(Some(&canonical));
+
+    doc.detect_editor_config();
+    doc.detect_indent_and_line_ending();
+
+    let loader = editor.syn_loader.load();
+    doc.detect_language_with_override(&loader, editor.language_override.as_deref());
+
+    let diagnostics = helix_view::Editor::doc_diagnostics(
+        &editor.language_servers,
+        &editor.diagnostics,
+        &doc,
+    );
+    doc.replace_diagnostics(diagnostics, &[], None);
 
     editor.new_document(doc)
 }
@@ -209,39 +309,6 @@ pub fn tear_down_session_on_editor(editor: &mut helix_view::Editor) {
     let doc_ids = session.all_doc_ids();
     for doc_id in &doc_ids {
         let _ = editor.close_document(*doc_id, true);
-    }
-}
-
-/// Refresh the diff_base bytes on every side document to match the live base
-/// text. Side panes show their own content vs base, so they need to be re-told
-/// after every base mutation (accept, undo, redo, direct edit).
-fn refresh_side_diff_bases(editor: &mut helix_view::Editor) {
-    let base_doc_id = match editor.merge_session.as_ref() {
-        Some(s) => s.base.doc_id,
-        None => return,
-    };
-    let base_bytes = match editor.documents.get(&base_doc_id) {
-        Some(d) => {
-            let mut bytes = Vec::new();
-            for chunk in d.text().chunks() {
-                bytes.extend_from_slice(chunk.as_bytes());
-            }
-            bytes
-        }
-        None => return,
-    };
-    let side_doc_ids: Vec<helix_view::DocumentId> = editor
-        .merge_session
-        .as_ref()
-        .unwrap()
-        .sides
-        .iter()
-        .map(|s| s.doc_id)
-        .collect();
-    for doc_id in &side_doc_ids {
-        if let Some(doc) = editor.documents.get_mut(doc_id) {
-            doc.set_diff_base(base_bytes.clone());
-        }
     }
 }
 
@@ -536,7 +603,6 @@ fn merge_history(cx: &mut Context, dir: HistoryDirection) {
     }
 
     refresh_regions(cx.editor);
-    refresh_side_diff_bases(cx.editor);
 }
 
 pub fn merge_undo(cx: &mut Context) {
@@ -787,7 +853,6 @@ fn accept_side(cx: &mut Context, side_idx: usize) {
     base_doc.apply(&transaction, base_view_id);
 
     refresh_regions(cx.editor);
-    refresh_side_diff_bases(cx.editor);
 
     let remaining = cx
         .editor

@@ -3068,6 +3068,11 @@ fn ensure_selections_forward(cx: &mut Context) {
 }
 
 fn enter_insert_mode(cx: &mut Context) {
+    let (_view, doc) = current!(cx.editor);
+    if doc.readonly {
+        cx.editor.set_status("Buffer is read-only");
+        return;
+    }
     cx.editor.mode = Mode::Insert;
 }
 

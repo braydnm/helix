@@ -1673,6 +1673,9 @@ impl Document {
     }
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
     pub fn apply(&mut self, transaction: &Transaction, view_id: ViewId) -> bool {
+        if self.readonly && !transaction.changes().is_empty() {
+            return false;
+        }
         self.apply_inner(transaction, view_id, true)
     }
 

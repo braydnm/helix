@@ -621,7 +621,13 @@ fn lsp_item_to_transaction(
         // we can still generate a transaction regardless but if the
         // document changed (and not just the selection) then we will
         // likely delete the wrong text (same if we applied an edit sent by the LS)
-        debug_assert!(primary_cursor == trigger_offset);
+        if primary_cursor != trigger_offset {
+            log::warn!(
+                "completion: cursor moved between trigger and accept ({} -> {}); inserted text may land at the wrong position",
+                trigger_offset,
+                primary_cursor
+            );
+        }
         (None, new_text)
     };
 

@@ -24,39 +24,75 @@ cd "$TMPDIR"
 
 jj git init --quiet
 
-# Base commit: two files that will diverge on each side.
+# Base commit: a plain-text file plus a Python file. Each side keeps the file
+# syntactically valid Python so an LSP server attached to the base pane has
+# something legitimate to chew on (hover, goto-def, diagnostics, etc.).
 cat > simple.txt <<'EOF'
 header line
 shared content here
 footer line
 EOF
-cat > multi.txt <<'EOF'
-line 1
-zone one: original
-line 3
-divider
-zone two: original
-line 6
+cat > app.py <<'EOF'
+"""Demo module for the helix merge smoke test."""
+
+
+def greet(name: str) -> str:
+    return f"Hello, {name}"
+
+
+def farewell(name: str) -> str:
+    return f"Goodbye, {name}"
+
+
+def main() -> None:
+    print(greet("world"))
+    print(farewell("world"))
+
+
+if __name__ == "__main__":
+    main()
 EOF
 jj describe --quiet -m "base"
 jj bookmark create --quiet -r @ base
 
-# Side A: edit both files.
-jj new --quiet -m "side A"
-sed -i 's/shared content here/Alice was here/' simple.txt
-sed -i 's/zone one: original/zone one: from Alice/' multi.txt
-sed -i 's/zone two: original/zone two: from Alice/' multi.txt
-jj bookmark create --quiet -r @ side_a
+# Five divergent sides, each tweaking both files in its own way. Merging all
+# five produces a 5-way conflict on each file.
+declare -A GREET=(
+    [a]='return f"HELLO, {name.upper()}!"'
+    [b]='return f"Hi there, {name}!!"'
+    [c]='return f"Hey {name}!"'
+    [d]='return f"Greetings, dear {name}"'
+    [e]='return f"yo {name.lower()}"'
+)
+declare -A FAREWELL=(
+    [a]='return f"Bye {name}, see you soon"'
+    [b]='return f"Catch you later, {name}"'
+    [c]='return f"Adieu, {name}"'
+    [d]='return f"Farewell, dear {name}"'
+    [e]='return f"peace {name.lower()}"'
+)
+declare -A SIMPLE=(
+    [a]='Alice was here'
+    [b]='Bob was here'
+    [c]='Carol was here'
+    [d]='Dave was here'
+    [e]='Eve was here'
+)
 
-# Side B: edit both files differently.
-jj new --quiet base -m "side B"
-sed -i 's/shared content here/Bob was here/' simple.txt
-sed -i 's/zone one: original/zone one: from Bob/' multi.txt
-sed -i 's/zone two: original/zone two: from Bob/' multi.txt
-jj bookmark create --quiet -r @ side_b
+SIDES=()
+for letter in a b c d e; do
+    jj new --quiet base -m "side $letter"
+    sed -i "s/shared content here/${SIMPLE[$letter]}/" simple.txt
+    sed -i "s|return f\"Hello, {name}\"|${GREET[$letter]}|" app.py
+    sed -i "s|return f\"Goodbye, {name}\"|${FAREWELL[$letter]}|" app.py
+    bookmark="side_$letter"
+    jj bookmark create --quiet -r @ "$bookmark"
+    SIDES+=("$bookmark")
+done
 
-# Merge: simple.txt has 1 conflict region, multi.txt has 2.
-jj new --quiet side_a side_b -m "merge"
+# Merge all five sides at once. simple.txt becomes a 5-way conflict and app.py
+# has two independent 5-way conflict regions.
+jj new --quiet "${SIDES[@]}" -m "merge"
 
 echo
 echo "--- jj status ---"
